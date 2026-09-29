@@ -1,0 +1,30 @@
+# Artefacts de run : ce sont des sorties, pas des sources. Les trois
+# repertoires sont traites de meme -- `reports/` manquait, et ses
+# fichiers nomment l'alias TNS et le schema de l'instance de test.
+logs/*
+!logs/.gitkeep
+
+work/*
+!work/.gitkeep
+
+reports/*
+!reports/.gitkeep
+
+*.dmp
+*.dump
+*.log
+
+# La configuration reelle contient un secret. Seul l'exemple est versionne.
+config/config.conf
+config/*.conf.bak
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+.vscode/
+.idea/
+
+.DS_Store
+Thumbs.db

@@ -1,0 +1,44 @@
+#!/bin/sh
+# Oracle Schema Duplicator — point d'entree.
+#
+# Ce script ne fait que localiser le code et le lancer. Il n'implémente
+# aucune logique : sous cron, un wrapper qui decide de quelque chose
+# devient tres vite un second point de defaillance, difficile a
+# diagnostiquer parce qu'il n'est pas dans le code principal.
+#
+# Le `PYTHONPATH` est pose relativement au script, et non en dur : le
+# depot peut etre deplace ou installe ailleurs sans retoucher le wrapper.
+
+set -e
+
+# Repertoire du script, resolu meme via un lien symbolique, pour
+# supporter une installation dans ~/bin ou /usr/local/bin.
+osd_self=$0
+while [ -L "$osd_self" ]; do
+    osd_link=$(readlink "$osd_self")
+    case "$osd_link" in
+        /*) osd_self=$osd_link ;;
+        *)  osd_self=$(dirname "$osd_self")/$osd_link ;;
+    esac
+done
+OSD_HOME=$(cd "$(dirname "$osd_self")/.." && pwd)
+
+# Le chemin du projet est insere par le code plutot que par PYTHONPATH.
+# `python3 -E` (implique par `-I`) ignore volontairement PYTHONPATH :
+# c'est la seule facon de garantir qu'aucune variable d'environnement
+# ne redirige l'import vers un autre `osd`.
+#
+# `-I` impose aussi `-s` et `-E`, donc le site-packages utilisateur est
+# ecarte : un module de meme nom que le projet, installe par un tiers,
+# ne peut pas prendre sa place. Un `osd` qui charge le mauvais code en
+# production est un bug quasi impossible a diagnostiquer sur le terrain.
+#
+# `sys.argv[0]` vaut `-c`, d'ou le `prog="osd"` explicite dans le
+# parseur d'arguments : l'aide affichee doit porter le nom de la
+# commande, pas celui du launcher interne.
+exec "${OSD_PYTHON:-python3}" -I -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from osd.cli import main
+sys.exit(main(sys.argv[2:]))
+' "$OSD_HOME/src" "$@"
