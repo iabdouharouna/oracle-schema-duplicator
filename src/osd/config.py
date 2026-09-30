@@ -59,6 +59,19 @@ TRANSFER_BACKENDS = ("auto", "rsync", "scp", "scp-legacy", "sftp")
 #: exigent `--allow-destructive`, sinon l'outil echoue en code 8.
 DESTRUCTIVE_ACTIONS = frozenset({"REPLACE", "TRUNCATE"})
 
+#: Cles d'authentification SSH retirees. Elles restent decrites dans le
+#: schema pour qu'un fichier de configuration existant soit lu sans
+#: erreur de cle inconnue, mais toute valeur portee declenche un refus
+#: explicite : l'exploitant doit savoir que le secret n'est plus lu.
+_OBSOLETE_SSH_KEYS = (
+    "SSH_KEY",
+    "OS_SSH_USER",
+    "SOURCE_SSH_USER",
+    "TARGET_SSH_USER",
+    "SOURCE_SSH_OPTS",
+    "TARGET_SSH_OPTS",
+)
+
 
 # --------------------------------------------------------------------------
 # Schema
@@ -103,23 +116,30 @@ def _schema() -> Dict[str, Spec]:
         "TARGET_SYSDBA": Spec("bool", False, doc="Connexion cible en SYSDBA."),
         # -- Execution distante ------------------------------------------
         # `*_HOST` vide => execution locale (le serveur de saut heberge la
-        # base). Renseigne => execution par SSH sur l'hote Oracle, seul cas
-        # ou `*_SSH_USER`, `*_TNS_ADMIN` et `*_DIRECTORY` ont un sens.
-        "SOURCE_HOST": Spec("str", "", doc="Hote SSH des bases source. Vide = local."),
-        "SOURCE_SSH_USER": Spec("str", "", doc="Compte SSH source. Vaut OS_SSH_USER si vide."),
-        # `StrictHostKeyChecking=accept-new` est le compromis retenu :
-        # il accepte une **premiere** connexion (indispensable en
-        # environnement neuf ou ephemere) mais refuse toute cle qui
-        # change, ce qui protege du vol de session. `yes` bloquerait un
-        # run cron sur un hote jamais contacte ; `no` accepterait une
-        # cle forgee. Une option par defut qui empeche le premier run
-        # est un defaut qui n'en est pas un.
-        "SOURCE_SSH_OPTS": Spec("csv", "BatchMode=yes,ConnectTimeout=10,StrictHostKeyChecking=accept-new"),
-        "TARGET_HOST": Spec("str", "", doc="Hote SSH des bases cible. Vide = local."),
-        "TARGET_SSH_USER": Spec("str", "", doc="Compte SSH cible. Vaut OS_SSH_USER si vide."),
-        "TARGET_SSH_OPTS": Spec("csv", "BatchMode=yes,ConnectTimeout=10,StrictHostKeyChecking=accept-new"),
-        "OS_SSH_USER": Spec("str", "", doc="Compte SSH par defaut, si les "
-                              "cotes ne sont pas specifiques."),
+        # base). Renseigne => execution par **Ansible** sur l'hote Oracle,
+        # seul cas ou `*_TNS_ADMIN` et `*_DIRECTORY` ont un sens.
+        #
+        # `*_HOST` designe un **nom d'inventaire**, pas une adresse : si
+        # l'inventaire pose `ansible_host`, les deux peuvent differer.
+        #
+        # Les identifiants SSH ne sont plus des cles de configuration.
+        # Ils vivent dans l'inventaire, chiffres par Ansible Vault, et
+        # Ansible est le seul processus a les voir. Les englober ici les
+        # mettrait dans un fichier ordinaire, donc dans une sauvegarde,
+        # et dans la sauvegarde de cette sauvegarde.
+        #
+        # `StrictHostKeyChecking=accept-new` reste le defaut cote
+        # inventaire : il accepte une premiere connexion (indispensable en
+        # environnement neuf) mais refuse toute cle qui change, ce qui
+        # protege du vol de session. `yes` bloquerait un run cron sur un
+        # hote jamais contacte ; `no` accepterait une cle forgee.
+        "SOURCE_HOST": Spec("str", "", doc="Nom d'inventaire de l'hote source. Vide = local."),
+        "TARGET_HOST": Spec("str", "", doc="Nom d'inventaire de l'hote cible. Vide = local."),
+        "OSD_INVENTORY": Spec("str", "inventory/hosts",
+                              doc="Inventaire Ansible designant les hotes."),
+        "OSD_VAULT_PASSWORD_FILE": Spec("str", "", secret=True,
+                                         doc="Fichier de mot de passe du coffre. "
+                                             "Hors du depot, en 0600."),
 
         # -- Data Pump ----------------------------------------------------
         "CONTENT": Spec("enum", "ALL", CONTENT_CHOICES),
@@ -144,7 +164,20 @@ def _schema() -> Dict[str, Spec]:
         # et utile surtout parce qu'un echec en mode force doit remonter
         # tel quel au lieu d'etre masque par un repli silencieux.
         "TRANSFER_MODE": Spec("enum", "AUTO", ("AUTO", "LOCAL", "SCP", "SCP-LEGACY", "RSYNC", "SFTP")),
-        "SSH_KEY": Spec("str", "", doc="Cle d'authentification SSH."),
+        # `SSH_KEY` et les quatre `*_SSH_USER` sont recus pour ne pas
+        # casser brutalement une configuration existante, mais refuses
+        # des qu'ils portent une valeur. Les accepter en silence serait
+        # pire que les refuser : l'exploitant croirait s'authentifier
+        # par cle alors que le secret ne serait lu par personne.
+        "SSH_KEY": Spec("str", "", doc="Obsolete. L'authentification SSH est "
+                             "dans l'inventaire Ansible, chiffree par Vault."),
+        "OS_SSH_USER": Spec("str", "", doc="Obsolete. Compte SSH dans "
+                             "l'inventaire (ansible_user)."),
+        "SOURCE_SSH_USER": Spec("str", "", doc="Obsolete. Voir OS_SSH_USER."),
+        "TARGET_SSH_USER": Spec("str", "", doc="Obsolete. Voir OS_SSH_USER."),
+        "SOURCE_SSH_OPTS": Spec("csv", "", doc="Obsolete. Options SSH dans "
+                               "l'inventaire (ansible_ssh_common_args)."),
+        "TARGET_SSH_OPTS": Spec("csv", "", doc="Obsolete. Voir SOURCE_SSH_OPTS."),
         # `STAGING_DIR` et `REMOTE_TRANSFER` sont des cles de compatibilite
         # avec une premiere version de la configuration. Elles sont
         # acceptees pour ne pas casser un fichier existant, mais refusees
@@ -509,21 +542,22 @@ def validate(cfg: Config, *, warnings: Optional[List[str]] = None) -> None:
         )
 
     # -- Coherence des options d'execution distante ----------------------
-    # Le compte SSH et la cle ne servent que si un hote est designe. Leur
-    # presence sans hote_signale une configuration incomplete : mieux vaut
-    # le dire que pretendre qu'une connexion par cle sera utilisee.
+    # L'authentification SSH n'est plus une option de ce fichier : elle
+    # vit dans l'inventaire Ansible, chiffree par Vault. Les six cles
+    # qui la portaient sont donc refusees des qu'elles portent une
+    # valeur -- une option acceptee et ignoree est pire qu'une option
+    # refusee, car elle laisse croire a un comportement qui n'existe pas.
+    for key in _OBSOLETE_SSH_KEYS:
+        if values.get(key):
+            raise ConfigError(
+                f"{key} n'est plus pris en charge",
+                hint="L'authentification SSH se declare dans "
+                     "l'inventaire Ansible, chiffre par Vault. Retirer "
+                     f"{key} de la configuration.",
+            )
     remote_sides = [
         prefix for prefix in ("SOURCE", "TARGET") if values.get(f"{prefix}_HOST")
     ]
-    if not remote_sides:
-        for key in ("SSH_KEY", "SOURCE_SSH_USER", "TARGET_SSH_USER", "OS_SSH_USER"):
-            if values.get(key):
-                raise ConfigError(
-                    f"{key} renseigne alors que SOURCE_HOST et TARGET_HOST "
-                    "sont vides",
-                    hint="Soit renseigner l'hote a joindre, soit retirer "
-                         "cette cle : l'execution locale n'emploie pas SSH.",
-                )
     # Un cote local et un cote distant n'est pas une topologie supportee.
     # `expdp` ecrit alors le dump sur le serveur de saut, `impdp` le lit
     # sur l'hote distant qui ne voit pas ce systeme de fichiers, et la
@@ -545,56 +579,48 @@ def validate(cfg: Config, *, warnings: Optional[List[str]] = None) -> None:
                  f"hotes distants : renseigner {manquant}_HOST, ou vider les "
                  f"deux pour une execution integrale sur le serveur de saut.",
         )
-    if values.get("SSH_KEY"):
-        for prefix in remote_sides:
-            path = Path(values["SSH_KEY"])
-            if not path.is_file():
-                raise ConfigError(
-                    f"SSH_KEY introuvable : {path}",
-                    hint="La cle doit etre lisible par le compte qui execute.",
-                )
-            mode = path.stat().st_mode & 0o777
-            if mode & 0o077:
-                # SSH refuse une cle lisible par d'autres ; mieux vaut le
-                # dire explicitement que laisser `ssh` echouer en distant
-                # avec un message qui ne parle que de permissions.
-                raise ConfigError(
-                    f"SSH_KEY trop permissive : {path} "
-                    f"(mode {mode:04o}, attendu 0600)",
-                    hint="Corriger par : chmod 600 " + str(path),
-                )
-    for prefix in remote_sides:
-        opts = values.get(f"{prefix}_SSH_OPTS") or []
-        joined = ",".join(opts)
-        # Sans BatchMode, une erreur d'authentification ouvre une invite
-        # et le run reste bloque jusqu'a l'expiration du crontab. C'est
-        # l'echec de mode le plus contre-intuitif : refuse a la lecture.
-        #
-        # La **valeur** est verifiee, pas seulement le nom du mot-cle.
-        # `BatchMode=no` passait le controle precedent : le nom y etait,
-        # et l'option est precisement celle qui produit le blocage que
-        # cette verification cherche a empecher. Un controle qui lit la
-        # presence d'un reglage sans lire son etat est un controle
-        # decoratif.
-        batch = [o for o in opts if o.lower().startswith("batchmode")]
-        if not batch:
+    # Inventaire Ansible : seule voie d'acces aux hotes distants.
+    if remote_sides:
+        inventory = values.get("OSD_INVENTORY", "")
+        if not inventory:
             raise ConfigError(
-                f"{prefix}_SSH_OPTS sans BatchMode",
-                hint="Ajouter BatchMode=yes pour qu'une erreur "
-                     "d'authentification echoue au lieu de bloquer.",
+                "OSD_INVENTORY absent alors qu'un hote distant est designe",
+                hint="Renseigner OSD_INVENTORY, ou vider SOURCE_HOST et "
+                     "TARGET_HOST pour une execution locale.",
             )
-        for option in batch:
-            if option.split("=", 1)[-1].strip().lower() != "yes":
-                raise ConfigError(
-                    f"{prefix}_SSH_OPTS contient {option}",
-                    hint="Seul BatchMode=yes est accepte : toute autre "
-                         "valeur ouvre une invite de mot de passe qui "
-                         "bloque le run jusqu'a l'expiration du crontab.",
-                )
-        if "ConnectTimeout" not in joined:
-            warnings.append(
-                f"{prefix}_SSH_OPTS sans ConnectTimeout : un hote injoignable "
-                "bloquera le run jusqu'a l'expiration du crontab."
+        path = Path(inventory)
+        if not path.is_file():
+            raise ConfigError(
+                f"OSD_INVENTORY introuvable : {inventory}",
+                hint="Le chemin est relatif au repertoire d'execution de "
+                     "`osd`, donc fragile sous cron : preferer un chemin "
+                     "absolu.",
+            )
+        vault = values.get("OSD_VAULT_PASSWORD_FILE", "")
+        if not vault:
+            raise ConfigError(
+                "OSD_VAULT_PASSWORD_FILE absent alors qu'un hote distant "
+                "est designe",
+                hint="Sans fichier de mot de passe de coffre, Ansible ne peut "
+                     "pas dechiffrer les mots de passe de l'inventaire. Le "
+                     "fichier doit etre hors du depot, en 0600.",
+            )
+        vpath = Path(vault)
+        if not vpath.is_file():
+            raise ConfigError(
+                f"OSD_VAULT_PASSWORD_FILE introuvable : {vault}",
+                hint="Le fichier doit exister et etre lisible par le compte "
+                     "qui execute.",
+            )
+        mode = vpath.stat().st_mode & 0o777
+        if mode & 0o077:
+            # Un mot de passe de coffre lisible par d'autres n'est pas un
+            # mot de passe de coffre : c'est une annotation. Le dire ici
+            # plutot que laisser Ansible echouer en disant autre chose.
+            raise ConfigError(
+                f"OSD_VAULT_PASSWORD_FILE trop permissive : {vault} "
+                f"(mode {mode:04o}, attendu 0600)",
+                hint="Corriger par : chmod 600 " + str(vault),
             )
 
     # -- Parallelisme : au-dela de 1, l'export produit N fichiers ---------

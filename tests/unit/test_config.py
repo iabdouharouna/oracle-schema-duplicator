@@ -126,15 +126,38 @@ class TestChargement(unittest.TestCase):
     def test_un_defaut_csv_est_bien_une_liste(self):
         """Un defaut de liste reste une liste apres chargement.
 
-        Si le defaut etait charge comme chaine, une verification qui
-        parcourrait la valeur inserait une virgule entre chaque caractere
-        et l'option SSH par defaut serait rejetee comme etant depourvue
-        de `BatchMode` — un echec qui n'aurait rien a voir avec la
-        configuration de l'utilisateur.
+        Le test portait sur `SOURCE_SSH_OPTS`, dont le defaut etait
+        `BatchMode=yes,ConnectTimeout=10,...`. Cette cle est desormais
+        retiree, mais la propriete qu'elle verifiait est generale et
+        reste vraie : chargee comme chaine, une liste serait parcourue
+        caractere par caractere, et chaque element insererait une
+        virgule. L'erreur serait alors ailleurs -- un element invalide
+        qu'aucun controle ne relie a la configuration de l'utilisateur.
+
+        Il faut donc une cle CSV **vivante** pour que le test garde un
+        sens. Toutes les cles CSV restantes ont un defaut vide, ce qui
+        suffit : la propriete a verifier est le **type** rendu, pas la
+        presence d'elements. Le defaut vide est le cas le plus
+        trompeur, puisqu'une chaine vide se parcourt sans erreur et ne
+        revele le defaut qu'a l'ecriture.
         """
-        cfg = support.load_config(SOURCE_HOST="hote-un", TARGET_HOST="hote-deux")
-        self.assertIsInstance(cfg.get("SOURCE_SSH_OPTS"), list)
-        self.assertIn("BatchMode=yes", cfg.get("SOURCE_SSH_OPTS"))
+        csv_vivantes = [
+            cle for cle, spec in cfg_mod.SCHEMA.items() if spec.kind == "csv"
+        ]
+        # Les cles retirees restent typees `csv` pour qu'un fichier
+        # existant soit lu, mais les renseigner declenche un refus. Les
+        # ecarter ici evite de transformer une verification de typage en
+        # test du refus, qui a son propre module.
+        csv_vivantes = [c for c in csv_vivantes if c not in cfg_mod._OBSOLETE_SSH_KEYS]
+        self.assertTrue(csv_vivantes, "aucune cle CSV vivante dans le schema")
+        for cle in csv_vivantes:
+            with self.subTest(cle=cle):
+                # Le defaut reste une liste...
+                self.assertIsInstance(support.load_config().get(cle), list)
+                # ...et une valeur explicite aussi.
+                self.assertEqual(
+                    support.load_config(**{cle: "a,b,c"}).get(cle), ["a", "b", "c"]
+                )
 
     def test_une_cle_vide_avec_defaut_emploie_le_defaut_et_signale(self):
         cfg = support.load_config(PARALLEL="")
@@ -305,75 +328,144 @@ class TestClesObsoletes(unittest.TestCase):
 
 
 class TestExecutionDistante(unittest.TestCase):
-    def test_refuse_batchmode_absent(self):
-        """Sans BatchMode, une erreur d'authentification ouvre une invite.
+    """Execution distante : l'inventaire est la seule voie d'acces.
 
-        Le run reste alors bloque jusqu'a l'expiration du crontab, avec
-        zero sortie et zero message. C'est l'echec de mode le plus
-        contre-intuitif, donc il est refuse a la lecture.
+    Les regles ont change de forme, pas de fond. Le controle portait
+    autrefois sur `*_SSH_OPTS` et sur la cle privee, tous deux pousses
+    dans l'inventaire Ansible. Les garanties recherchees restent
+    identiques et sont donc re-exprimees sur les nouveaux supports :
+
+    * un hote designe sans inventaire exploitable doit etre refuse a la
+      lecture, pas decouvert a l'etape 4 ;
+    * un mot de passe de coffre lisible par d'autres doit etre refuse,
+      pour la meme raison qu'une cle lisible par d'autres l'etait ;
+    * une des six cles retirees doit etre refusee des qu'elle porte une
+      valeur, sans quoi l'exploitant croirait qu'elle agit encore.
+    """
+
+    def test_refuse_un_inventaire_absent(self):
+        with self.assertRaises(ConfigError) as ctx:
+            support.load_config(
+                SOURCE_HOST="h", TARGET_HOST="h2",
+                OSD_INVENTORY="/nonexistent/inventaire",
+            )
+        self.assertIn("OSD_INVENTORY", str(ctx.exception))
+        self.assertIn("introuvable", str(ctx.exception))
+
+    def test_refuse_un_hote_sans_mot_de_passe_de_coffre(self):
+        """Sans le secret du coffre, Ansible ne peut rien dechiffrer.
+
+        L'erreur doit nommer la cle manquante : c'est elle que
+        l'exploitant doit ajouter, et le dire evite qu'il cherche du
+        cote des identifiants, qui ne sont plus la.
         """
         with self.assertRaises(ConfigError) as ctx:
-            support.load_config(SOURCE_HOST="h", TARGET_HOST="h2", SOURCE_SSH_OPTS="ConnectTimeout=10")
-        self.assertIn("BatchMode", str(ctx.exception))
+            support.load_config(
+                SOURCE_HOST="h", TARGET_HOST="h2", OSD_VAULT_PASSWORD_FILE=""
+            )
+        self.assertIn("OSD_VAULT_PASSWORD_FILE", str(ctx.exception))
 
-    def test_avertit_sans_connect_timeout(self):
-        cfg = support.load_config(
-            SOURCE_HOST="h", TARGET_HOST="h2", SOURCE_SSH_OPTS="BatchMode=yes"
-        )
-        self.assertTrue(any("ConnectTimeout" in w for w in cfg.warnings))
+    def test_refuse_un_mot_de_passe_de_coffre_absent(self):
+        with self.assertRaises(ConfigError) as ctx:
+            support.load_config(
+                SOURCE_HOST="h", TARGET_HOST="h2",
+                OSD_VAULT_PASSWORD_FILE="/nonexistent/vault-pass",
+            )
+        self.assertIn("introuvable", str(ctx.exception))
 
-    def test_refuse_une_cle_ssh_trop_ouverte(self):
-        """`ssh` refuse une cle lisible par d'autres ; mieux vaut le dire ici.
+    def test_refuse_un_mot_de_passe_de_coffre_trop_ouvert(self):
+        """Un secret de coffre lisible par d'autres n'est pas un secret.
 
-        L'echec de `ssh` ne parle que de permissions, ce qui oriente vers
-        le mauvais probleme et fait perdre du temps sur un AIX de
-        production.
+        Meme raison que pour la cle privee remplacee : le dire ici evite
+        un echec d'Ansible dont le message ne parle que de
+        permissions, ce qui oriente vers le mauvais probleme et fait
+        perdre du temps sur un AIX de production.
         """
         with tempfile.TemporaryDirectory() as tmp:
-            key = Path(tmp) / "id_rsa"
-            key.write_text("x")
-            key.chmod(0o644)
+            coffre = Path(tmp) / "vault-pass"
+            coffre.write_text("secret\n")
+            coffre.chmod(0o644)
             with self.assertRaises(ConfigError) as ctx:
-                support.load_config(SOURCE_HOST="h", TARGET_HOST="h2", SSH_KEY=str(key))
+                support.load_config(
+                    SOURCE_HOST="h", TARGET_HOST="h2",
+                    OSD_VAULT_PASSWORD_FILE=str(coffre),
+                )
             self.assertIn("600", str(ctx.exception))
 
-    def test_refuse_une_cle_ssh_inexistante(self):
-        with self.assertRaises(ConfigError):
-            support.load_config(SOURCE_HOST="h", TARGET_HOST="h2", SSH_KEY="/nonexistent/id_rsa")
+    def test_accepte_un_mot_de_passe_de_coffre_0600(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coffre = Path(tmp) / "vault-pass"
+            coffre.write_text("secret\n")
+            coffre.chmod(0o600)
+            cfg = support.load_config(
+                SOURCE_HOST="h", TARGET_HOST="h2",
+                OSD_VAULT_PASSWORD_FILE=str(coffre),
+            )
+            self.assertEqual(cfg.get("OSD_VAULT_PASSWORD_FILE"), str(coffre))
 
-    def test_accepte_une_cle_0600(self):
+    def test_refuse_une_cle_ssh_obsolete_renseignee(self):
+        """Une cle retiree mais honoree laisserait croire a son effet.
+
+        Le pire scenario n'est pas le refus : c'est l'acceptation
+        silencieuse. L'exploitant aurait depose une cle, verrait le run
+        echouer pour une autre raison, et ne soupconnerait pas que le
+        secret n'a jamais ete lu. Le refus doit donc nommer la cle et
+        dire ou elle va desormais.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             key = Path(tmp) / "id_rsa"
             key.write_text("x")
             key.chmod(0o600)
-            cfg = support.load_config(SOURCE_HOST="h", TARGET_HOST="h2", SSH_KEY=str(key))
-            self.assertEqual(cfg.get("SSH_KEY"), str(key))
+            with self.assertRaises(ConfigError) as ctx:
+                support.load_config(SOURCE_HOST="h", TARGET_HOST="h2", SSH_KEY=str(key))
+            self.assertIn("SSH_KEY", str(ctx.exception))
+            self.assertIn("n'est plus pris en charge", str(ctx.exception))
+            self.assertIn("inventaire", str(ctx.exception.hint))
 
-    def test_refuse_batchmode_desactive(self):
-        """`BatchMode=no` passait le controle, qui ne lisait que le nom.
+    def test_refuse_toutes_les_cles_ssh_obsoletes(self):
+        """Les six cles retirees sont refusees, sans exception.
 
-        Le controle verifiait `"BatchMode" not in joined` : le mot-cle y
-        etait, et l'option est precisement celle qui produit le blocage
-        que la verification cherche a empecher. Un controle qui lit la
-        presence d'un reglage sans lire son etat est decoratif — et
-        celui-ci etait le seul a garantir le mode d'echec le plus cher
-        du projet : un run bloque jusqu'a l'expiration du crontab, sans
-        journal et sans code de sortie.
+        Une seule qui serait encore acceptee suffirait a laisser un
+        exploitant avec une configuration qui semble fonctionner et
+        qui n'authentifie personne.
         """
-        with self.assertRaises(ConfigError) as ctx:
-            support.load_config(
-                SOURCE_HOST="h", TARGET_HOST="h2",
-                SOURCE_SSH_OPTS="BatchMode=no,ConnectTimeout=10",
-            )
-        self.assertIn("BatchMode=no", str(ctx.exception))
-        self.assertIn("cron", str(ctx.exception.hint))
+        for cle in (
+            "SSH_KEY",
+            "OS_SSH_USER",
+            "SOURCE_SSH_USER",
+            "TARGET_SSH_USER",
+            "SOURCE_SSH_OPTS",
+            "TARGET_SSH_OPTS",
+        ):
+            with self.subTest(cle=cle):
+                with self.assertRaises(ConfigError) as ctx:
+                    support.load_config(SOURCE_HOST="h", TARGET_HOST="h2", **{cle: "quelque-chose"})
+                self.assertIn(cle, str(ctx.exception))
 
-    def test_accepte_batchmode_yes(self):
+    def test_accepte_les_cles_obsoletes_a_vide(self):
+        """Vides, elles restent tolerees : un fichier existant reste lisible.
+
+        C'est le meme compromis que pour `STAGING_DIR` : refuser une cle
+        vide obligerait a editer le fichier de configuration a la main,
+        alors que sa valeur est sans effet.
+        """
+        cfg = support.load_config(SOURCE_HOST="h", TARGET_HOST="h2", SSH_KEY="", OS_SSH_USER="")
+        self.assertEqual(cfg.get("SSH_KEY"), "")
+        self.assertEqual(cfg.get("OS_SSH_USER"), "")
+
+    def test_execution_locale_n_exige_pas_d_inventaire(self):
+        """Sans hote, il n'y a rien a authentifier : pas de coffre exige.
+
+        Exiger l'inventaire en execution locale imposerait une
+        dependance inutile au mode le plus simple, qui est aussi le mode
+        de developpement. Le defaut est donc accepte tel quel : c'est
+        l'absence d'inventaire exploitable qui compte, pas sa valeur.
+        """
         cfg = support.load_config(
-            SOURCE_HOST="h", TARGET_HOST="h2",
-            SOURCE_SSH_OPTS="BatchMode=yes,ConnectTimeout=10",
+            SOURCE_HOST="", TARGET_HOST="",
+            OSD_VAULT_PASSWORD_FILE=None, OSD_INVENTORY=None,
         )
-        self.assertIn("BatchMode=yes", cfg.get("SOURCE_SSH_OPTS"))
+        self.assertEqual(cfg.get("OSD_VAULT_PASSWORD_FILE"), "")
 
 
 class TestTopologieMixte(unittest.TestCase):
@@ -400,21 +492,24 @@ class TestTopologieMixte(unittest.TestCase):
             support.load_config(SOURCE_HOST="", TARGET_HOST="h")
         self.assertIn("SOURCE_HOST", str(ctx.exception))
 
-    def test_le_refus_precede_le_controle_de_cle(self):
+    def test_le_refus_de_topologie_precede_le_controle_de_porte(self):
         """L'ordre des controles n'est pas indifferent.
 
-        Le message sur `BatchMode` ou sur la cle n'a de sens que si les
-        deux cotes sont distants. Annoncer « cle trop permissive » d'une
-        configuration mixte, dont le probleme est la topologie, ferait
-        corriger un reglage qui n'est pas en cause.
+        Le controle de l'inventaire ou du coffre n'a de sens que si les
+        deux cotes sont distants. Annoncer « mot de passe de coffre trop
+        permissif » d'une configuration mixte, dont le probleme est la
+        topologie, ferait corriger un reglage qui n'est pas en cause --
+        et l'exploitant repasserait, au meme resultat, sur une
+        configuration ou le probleme de topologie reste entier.
         """
         with tempfile.TemporaryDirectory() as tmp:
-            key = Path(tmp) / "id_rsa"
-            key.write_text("x")
-            key.chmod(0o644)
+            coffre = Path(tmp) / "vault-pass"
+            coffre.write_text("secret\n")
+            coffre.chmod(0o644)
             with self.assertRaises(ConfigError) as ctx:
                 support.load_config(
-                    SOURCE_HOST="h", TARGET_HOST="", SSH_KEY=str(key)
+                    SOURCE_HOST="h", TARGET_HOST="",
+                    OSD_VAULT_PASSWORD_FILE=str(coffre),
                 )
             self.assertIn("TARGET_HOST est vide", str(ctx.exception))
 
@@ -449,13 +544,22 @@ class TestFichierExemple(unittest.TestCase):
 
     def test_parse_sans_erreur(self):
         path = Path(__file__).resolve().parent.parent.parent / "config" / "config.example.conf"
-        raw = cfg_mod.parse_conf(path.read_text(encoding="utf-8"), origin=str(path))
+        texte = path.read_text(encoding="utf-8")
+        raw = cfg_mod.parse_conf(texte, origin=str(path))
         # Toute cle documentee existe dans le schema...
         self.assertEqual([k for k in raw if k not in cfg_mod.SCHEMA], [])
-        # ...et toute cle du schema est documentee, sauf les trois
-        # explicitement marquees obsoletes.
+        # ...et toute cle du schema est documentee. Les seules tolerees
+        # absentes sont celles que le gabarit ecrit en commentaire : les
+        # deux obsoletes d'origine, et les six cles SSH retirees. Les
+        # garder actives donnerait au recopieur une configuration qui
+        # echoue a la lecture, ce qui est le pire des deux mondes.
+        tolerees = {"STAGING_DIR", "REMOTE_TRANSFER"} | set(cfg_mod._OBSOLETE_SSH_KEYS)
         manquantes = set(cfg_mod.schema_keys()) - set(raw)
-        self.assertLessEqual(manquantes, {"STAGING_DIR", "REMOTE_TRANSFER"})
+        self.assertLessEqual(manquantes, tolerees)
+        # Chacune doit quand meme etre nommee dans le gabarit : une
+        # option retiree sans mention laisse un exploitant sans piste.
+        for cle in cfg_mod._OBSOLETE_SSH_KEYS:
+            self.assertIn(cle, texte)
 
     def test_le_fichier_exemple_n_est_pas_le_mot_de_passe(self):
         path = Path(__file__).resolve().parent.parent.parent / "config" / "config.example.conf"

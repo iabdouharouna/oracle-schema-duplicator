@@ -113,7 +113,7 @@ class TestExclusionMutuelle(unittest.TestCase):
     toujours, y compris si la protection etait completement absente.
     Les enfants ci-dessous sont de vrais processus, obtenus par
     `subprocess`, car c'est la seule maniere d'eprouver ce que
-    l'ordonnanceur和其它 outils declenchent reellement.
+    l'ordonnanceur et les autres outils declenchent reellement.
     """
 
     def setUp(self):

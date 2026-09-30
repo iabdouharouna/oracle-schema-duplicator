@@ -50,7 +50,8 @@ from ..errors import (
 )
 from ..logging_setup import get_logger, set_step
 from ..redact import redact
-from ..runner import LocalRunner, RemoteRunner, build_script, load_body
+from ..adapters import ansible_runner
+from ..runner import LocalRunner, build_script, load_body
 from ..state import DONE, FAILED, SKIPPED, State
 
 LOG = get_logger()
@@ -1042,7 +1043,13 @@ class Pipeline:
             source_runner=self.source_runner,
             target_runner=self.target_runner,
             mode=self.cfg.get("TRANSFER_MODE"),
-            ssh_key=self.cfg.get("SSH_KEY"),
+            # Le transfert n'est pas execute par Ansible, mais il a besoin
+            # du meme secret. On va le chercher **aupres du runner**, qui
+            # l'a deja lu dans le coffre : une seule lecture du secret,
+            # une seule source de verite. Le `getattr` couvre les runners
+            # qui n'ont rien a fournir -- `LocalRunner` et le `NullRunner`
+            # du dry-run.
+            ssh_password=_mot_de_passe_ssh(self.source_runner),
             probe_cache_dir=Path(self.cfg.get("WORK_DIR")) / "probes",
         )
 
@@ -1472,14 +1479,21 @@ class Pipeline:
         if not host:
             real = LocalRunner()
         else:
-            real = RemoteRunner(
-                host=host,
-                # Le compte par defaut evite de redoubler un login dans
-                # chaque configuration alors que les deux cotes partagent
-                # generalement le meme compte d'exploitation.
-                user=str(self.cfg.get(f"{prefix}_SSH_USER", "")) or str(self.cfg.get("OS_SSH_USER", "")),
-                ssh_opts=self.cfg.get(f"{prefix}_SSH_OPTS", []),
-                identity=str(self.cfg.get("SSH_KEY", "")),
+            # Execution distante par Ansible. Le nom d'hote est celui de
+            # l'inventaire : l'adresse reelle peut differer, si
+            # l'inventaire pose `ansible_host`. Les identifiants SSH ne
+            # sont plus lus ici -- ils sont dans l'inventaire, chiffres
+            # par Vault, et Ansible est le seul a les voir.
+            real = ansible_runner.AnsibleRunner(
+                host,
+                inventory=str(self.cfg.get("OSD_INVENTORY", "")),
+                group=(
+                    ansible_runner.GROUP_SOURCE
+                    if prefix == "SOURCE"
+                    else ansible_runner.GROUP_TARGET
+                ),
+                vault_password_file=str(self.cfg.get("OSD_VAULT_PASSWORD_FILE", "")),
+                side=prefix.lower(),
             )
         if self.dry_run:
             return null_mod.NullRunner(real, f"{prefix.lower()}-dryrun")
@@ -1525,6 +1539,32 @@ def _secure(path: Path) -> None:
         os.chmod(path, 0o700)
     except OSError:  # pragma: no cover
         pass
+
+
+def _mot_de_passe_ssh(runner) -> str:
+    """Secret SSH que le runner sait fournir, ou chaine vide.
+
+    Le transfert du dump (etape 13) passe par `scp`/`rsync`/`sftp`
+    lances depuis le serveur de saut, donc hors du chemin d'Ansible. Il
+    doit pourtant s'authentifier sur la source avec le meme mot de passe
+    que le runner, et celui-ci ne le connait pas : il ne fait que le
+    transmettre a `sshpass`, dans son processus.
+
+    D'ou cette fonction, qui interroge le runner et laisse une chaine
+    vide si la methode n'existe pas. C'est le cas de `LocalRunner` et du
+    `NullRunner` du dry-run, et c'est la bonne reponse dans les deux
+    cas : en execution locale il n'y a rien a authentifier, et en
+    simulation le transfert n'est de toute facon jamais tente. La valeur
+    obtenue n'est pas journalisee : `redact` couvre le trace, et le
+    rapport ne doit pas la contenir.
+    """
+    methode = getattr(runner, "ssh_password", None)
+    if not callable(methode):
+        return ""
+    try:
+        return methode() or ""
+    except Exception:  # pragma: no cover - le runner reporte lui-meme
+        return ""
 
 
 def _lit(value: str) -> str:

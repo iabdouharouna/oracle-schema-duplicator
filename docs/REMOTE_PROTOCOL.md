@@ -6,15 +6,141 @@ vérifié par `tests/unit/test_protocol.py`.
 
 ## Transport
 
-Le script complet part sur `stdin` :
+L'exécution distante passe par **Ansible**, en simple transport. Le script
+n'est pas un script Ansible : c'est le même script POSIX qu'avant, écrit dans
+un fichier `0600` éphémère, et Ansible ne fait que l'exécuter sur l'hôte
+désigné par l'inventaire.
 
-```sh
-ssh -o BatchMode=yes -o ConnectTimeout=10 <hote> sh -s
+```
+ansible <hote> -i <inventaire> --vault-password-file <fichier>
+       -m script -a <script> -- <args>
 ```
 
-`BatchMode=yes` est **exigé** par la validation. Sans lui, une erreur
-d'authentification ouvre une invite interactive et le run reste bloqué jusqu'à
-l'expiration du crontab.
+Ce choix mérite d'être justifié, car l'autre — réécrire les dix-neuf étapes en
+tâches Ansible — était défendable.
+
+**Ce qu'Ansible apporte** est exactement ce qui manquait :
+l'authentification par coffre chiffré, la lecture d'un inventaire, et un seul
+endroit où se déclarent les hôtes, les comptes et les clés. Les identifiants
+SSH ne sont donc plus dans la configuration de l'outil, donc plus dans une
+sauvegarde ordinaire.
+
+**Ce qu'Ansible n'apporte pas** est le protocole : le bloc de résultat
+`OSD_RESULT_BEGIN` / `OSD_RESULT_END`, le code de retour, la remontée des
+codes ORA. Ces éléments sont validés sur instance réelle depuis le début du
+projet, et les réécrire en tâches n'aurait rien apporté d'autre que le risque
+de les régresser.
+
+Le pipeline reste donc responsable de l'ordre des étapes : Ansible est
+l'infrastructure, pas l'automate.
+
+### Le code de retour ne vient pas d'Ansible
+
+`ansible -m script` renvoie `rc=0` **même quand le script sort en erreur**.
+Vérifié empiriquement, et c'est le piège qui ferait passer un export raté pour
+un succès.
+
+Le code réel est donc lu dans le bloc de résultat :
+
+```
+osd_finish 3   ->  OSD_RESULT_END rc=3
+```
+
+Le `rc` d'Ansible est ramené à `0` puis ignoré. Le refus d'un bloc sans
+`rc=` est explicite : un bloc tronqué — script tué, connexion perdue — ne se
+distingue pas d'un succès.
+
+### La sortie est récupérée par le descripteur 3
+
+Le protocole redirige la sortie de l'outil vers `fd 3` (`exec 3>&1`) et
+laisse `stdout` au client, sinon Ansible l'encombrerait de son propre
+`SUCCESS => {...}`. Le corps des scripts écrit par `osd_kv`, qui vise `fd 3` ;
+c'est ce descripteur qu'Ansible récupère intact.
+
+### Ce que l'inventaire fournit, et à qui
+
+L'inventaire (`OSD_INVENTORY`) alimente deux chemins de nature différente, et
+c'est la source de plusieurs défauts dont les symptômes ne désignaient pas la
+cause :
+
+| Besoin | Consommateur | Variable |
+|--------|--------------|----------|
+| Exécuter | Ansible | `ansible_host`, `ansible_user` |
+| Options SSH du transfert | `scp`/`rsync`/`sftp` | `ansible_ssh_common_args` |
+| Adresse du transfert | `scp`/`rsync`/`sftp` | `ansible_host` |
+| Compte du transfert | `scp`/`rsync`/`sftp` | `ansible_user` |
+| Clé privée | `scp`/`rsync`/`sftp` | `ansible_ssh_private_key_file` |
+
+Le transfert est **hors Ansible** : `scp`, `rsync` et `sftp` sont des clients
+du serveur de saut et ignorent l'inventaire. Il en découle trois traductions
+obligatoires :
+
+- le **nom d'inventaire** n'est résolvable que par Ansible. Sans
+  `ansible_host` traduit en adresse, la commande porterait
+  `scp osd_source:/...` et échouerait sur une résolution de nom — après douze
+  étapes réussies et un export achevé ;
+- `ansible_ssh_private_key_file` est une variable **seule**, que
+  `ansible_ssh_common_args` ne porte pas. Traduite en `IdentityFile`, sinon un
+  inventaire authentifié par clé — le mode recommandé — exécuterait tout le
+  run puis échouerait à la copie ;
+- `ansible_ssh_args` n'est **pas** repris : un `-i` posé là est lu par
+  Ansible et ignoré par le transfert. Le gabarit le dit.
+
+Le partage du secret se fait par `ansible -m debug`, avec le joker posé dans
+l'expression :
+
+```
+msg={{ ansible_password | default("") }}
+```
+
+Sans le joker, une variable absente ne produit aucun statut d'échec
+exploitable : `ansible -m debug` renvoie `msg` avec le texte « the task
+includes an option with an undefined variable », `failed` restant vide. Ce
+texte deviendrait alors le mot de passe remis à `sshpass`, et l'échec
+n'apparaîtrait qu'à la copie, sous la forme d'une authentification refusée
+sans lien visible avec sa cause.
+
+## Profil de connexion
+
+Chaque script commence par sourcer le profil de l'hôte :
+
+```sh
+for _osd_prof in /etc/profile "$HOME/.profile" "$HOME/.profile.ksh"; do
+    [ -r "$_osd_prof" ] || continue
+    sh -n "$_osd_prof" >/dev/null 2>&1 || continue
+    . "$_osd_prof" >/dev/null 2>&1 || :
+done
+export PATH
+```
+
+Ce n'est pas une précaution de confort. Un client Oracle sur AIX est dans le
+`PATH` du compte d'exploitation, posé par ces fichiers, et **ce que nous
+lançons n'est ni une session interactive ni une session de connexion** :
+Ansible comme `ssh` ouvrent une coquille non interactive, qui ne source rien.
+Sans ce bloc, `expdp` paraît absent sur un hôte où il est installé, et le
+remède nommé par l'étape 3 — vérifier le `PATH` du compte — n'a rien à
+vérifier puisque c'est précisément le `PATH` de l'exploitant qui fait
+défaut.
+
+Quatre points, chacun parce que son défaut a été observé :
+
+- **avant `set -u`** — un profil ne déclare pas toujours les variables
+  qu'il initialise ; sourcé après, le script meurt avant le prelude, donc
+  avant tout résultat : un échec muet, sans bloc à analyser ni à rapporter.
+- **validé par `sh -n`** — une erreur de syntaxe n'est pas un échec
+  d'exécution, elle tue le shell courant et `|| :` n'y change rien. Le cas
+  réel est un `.profile` écrit en bash sur un hôte dont `/bin/sh` est dash :
+  il casse **tous** les scripts. Le contrôle ne laisse passer que ce que le
+  shell qui va le sourcer sait exécuter.
+- **sourcé dans ce shell**, pas dans un sous-shell — un `$( . "$p" )`
+  isolerait le `PATH` mais perdrait `ORACLE_HOME`, sans lequel `sqlplus`
+  échoue en SP2-0750. Le prix de l'erreur de syntaxe est donc un profil
+  **ignoré**, pas un script perdu.
+- **`PATH` ré-exporté** — un profil l'affecte sans toujours l'exporter, et
+  une variable non exportée n'agit sur aucune commande qui suit la source.
+
+Aucun de ces fichiers n'est obligatoire, et le coût est de trois appels à
+`sh -n` par script.
 
 ## Assemblage
 

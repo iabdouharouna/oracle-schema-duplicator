@@ -36,7 +36,8 @@ import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-import support  # noqa: F401
+import support
+from support import isoler_home
 
 from osd import exit_codes as ec
 from osd.adapters.datapump import (
@@ -620,6 +621,12 @@ class TestHygieneDuParfile(unittest.TestCase):
         self._path_de_base = os.environ.get("PATH", "")
         os.environ["PATH"] = f"{self.bin_dir}{os.pathsep}{self._path_de_base}"
         self.addCleanup(self._restaurer_path)
+        # Le faux client doit rester **premier** dans le `PATH`. Un
+        # `~/.profile` qui prepend `ORACLE_HOME/bin` le repousserait
+        # derriere le vrai `expdp`, et le test mesurerait l'instance
+        # locale au lieu du code de l'outil -- en passant au vert.
+        # Voir `support.isoler_home`.
+        isoler_home(self)
         self.oracle = CoteOracleSimule()
         self.adapter = DataPumpAdapter(
             self.oracle.side, parfile_dir=str(self.racine), oracle=self.oracle
@@ -792,6 +799,12 @@ class TestCeQueLeClientVoit(unittest.TestCase):
         self._path_de_base = os.environ.get("PATH", "")
         os.environ["PATH"] = f"{self.bin_dir}{os.pathsep}{self._path_de_base}"
         self.addCleanup(self._restaurer_path)
+        # Le faux client doit rester **premier** dans le `PATH`. Un
+        # `~/.profile` qui prepend `ORACLE_HOME/bin` le repousserait
+        # derriere le vrai `expdp`, et le test mesurerait l'instance
+        # locale au lieu du code de l'outil -- en passant au vert.
+        # Voir `support.isoler_home`.
+        isoler_home(self)
         self.oracle = CoteOracleSimule()
         self.oracle.side.directory = str(self.racine)
         self.adapter = DataPumpAdapter(

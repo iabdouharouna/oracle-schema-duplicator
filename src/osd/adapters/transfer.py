@@ -27,6 +27,7 @@ lieu de bloquer sur une invite.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import time
@@ -95,6 +96,54 @@ _PROBE_CONTENT = b"osd-probe\n" * 16
 _run_command = subprocess.run
 
 
+#: Nom de la variable d'environnement par laquelle `sshpass` lit le mot
+#: de passe. C'est la seule voie supportee : `sshpass -p` mettrait le
+#: secret dans la ligne de commande, donc dans `ps` pour tout utilisateur
+#: du serveur de saut, et la trace resterait dans les journaux du
+#: superviseur.
+_SSHPASS_ENV = "SSHPASS"
+
+#: Options `sshpass` imposees quand un mot de passe est employe.
+#:
+#: `sshpass` n'accepte que ses propres options (`-f`, `-d`, `-p`, `-e`).
+#: Les options **SSH** ne se mettent pas ici : elles s'appliquent a la
+#: commande enveloppee, et `sshpass` les refuserait. L'erreur dit
+#: `invalid option -- 'o'`, ce qui ne rattache pas la cause au bon
+#: niveau -- on cherche une option SSH chez le mauvais programme.
+#:
+#: D'ou la separation : `_prefixe_sshpass` ne construit que
+#: `sshpass -e`, et `_merge_opts` pose `BatchMode=no` et
+#: `NumberOfPasswordPrompts=1` sur la commande reellement executee.
+_SSHPASS_BIN = "sshpass"
+
+
+def _env_avec_mot_de_passe(mot_de_passe: str) -> Optional[Dict[str, str]]:
+    """Environnement du transfert, avec `SSHPASS` si un mot de passe est fourni.
+
+    Retourne `None` quand aucun mot de passe n'est fourni : dans ce cas
+    le transfert tente l'authentification par cle, et l'echec doit venir
+    de `ssh` lui-meme, qui en dit plus qu'un `sshpass` sans secret.
+    """
+    if not mot_de_passe:
+        return None
+    env = dict(os.environ)
+    env[_SSHPASS_ENV] = mot_de_passe
+    return env
+
+
+def _prefixe_sshpass(mot_de_passe: str) -> List[str]:
+    """Prefixe `sshpass` a prependre a une commande de transfert.
+
+    `-e` est la seule voie acceptee. `sshpass -p` mettrait le secret dans
+    la ligne de commande, donc dans `ps` pour tout utilisateur du
+    serveur de saut, et l'empreinte resterait dans les journaux du
+    superviseur.
+    """
+    if not mot_de_passe:
+        return []
+    return [_SSHPASS_BIN, "-e"]
+
+
 @dataclass
 class TransferOutcome:
     """Resultat d'un transfert."""
@@ -139,14 +188,21 @@ class TransferBackend:
         source_runner,
         target_runner,
         mode: str = "auto",
-        ssh_key: str = "",
+        ssh_password: str = "",
         probe_cache_dir: Optional[Path] = None,
         bandwidth_limit: str = "",
     ) -> None:
         self.source = source_runner
         self.target = target_runner
         self.mode = mode
-        self.ssh_key = ssh_key
+        # Le transfert n'est **pas** execute par Ansible : ce sont
+        # `scp`/`rsync`/`sftp` lances depuis le serveur de saut, donc
+        # hors du chemin du runner. L'authentification par mot de passe
+        # passe donc par `sshpass`, qui lit le secret dans
+        # l'environnement -- jamais dans un argument, ou `ps` le
+        # montrerait. Vide = pas de mot de passe fourni, et le
+        # transfert echouera sur une authentification par cle absente.
+        self.ssh_password = ssh_password
         self.cache_dir = Path(probe_cache_dir) if probe_cache_dir else None
         self.bandwidth_limit = bandwidth_limit
         self._resolved: Optional[str] = None
@@ -415,10 +471,17 @@ class TransferBackend:
             LOG.info("transfert simule : %s (%s)", name, backend)
             return False
 
-        ssh_opts = _merge_opts(getattr(self.source, "ssh_opts", []), self.ssh_key)
+        # Options **brutes** ici : chaque constructeur de commande les
+        # fusionne lui-meme, et c'est lui qui sait sous quelle forme
+        # OpenSSH les veut (`-e "ssh ..."` pour `rsync`, `-o` repete
+        # pour `scp`). Fusionner ici ajouterait une seconde fois
+        # `BatchMode` et `NumberOfPasswordPrompts` : sans effet sur le
+        # comportement, mais visible dans les journaux et dans le
+        # rapport, ou une repetition signe une double responsabilite.
+        ssh_opts = _opts_du_runner(self.source)
 
         if backend == "rsync":
-            cmd = self._rsync_command(src_dir, dst_dir, name, ssh_opts, probe)
+            cmd = self._rsync_command(src_dir, dst_dir, name, ssh_opts)
         elif backend in ("scp", "scp-legacy"):
             cmd = self._scp_command(src_dir, dst_dir, name, ssh_opts, legacy=backend == "scp-legacy")
         elif backend == "sftp":
@@ -431,6 +494,10 @@ class TransferBackend:
             self._last_reason = f"backend inconnu: {backend}"
             return False
 
+        # L'enveloppe est posee ici, une fois pour tous les backends :
+        # `rsync`, `scp` et `sftp` appellent tous `ssh` en sous-processus,
+        # et c'est ce sous-processus, lui, qui a besoin du mot de passe.
+        cmd = _prefixe_sshpass(self.ssh_password) + cmd
         try:
             proc = _run_command(
                 cmd,
@@ -438,6 +505,7 @@ class TransferBackend:
                 stderr=subprocess.PIPE,
                 timeout=_PROBE_TIMEOUT if probe else None,
                 check=False,
+                env=_env_avec_mot_de_passe(self.ssh_password),
             )
         except FileNotFoundError:
             self._last_reason = f"client {backend} absent du serveur de saut"
@@ -455,7 +523,7 @@ class TransferBackend:
         return True
 
     def _rsync_command(
-        self, src_dir: str, dst_dir: str, name: str, ssh_opts: Sequence[str], probe: bool
+        self, src_dir: str, dst_dir: str, name: str, ssh_opts: Sequence[str]
     ) -> List[str]:
         """Commande `rsync` : le plus robuste, et le seul resumable.
 
@@ -471,13 +539,40 @@ class TransferBackend:
         et `-e` étant a valeur unique, seule la derniere comptait. Voir
         la note de version sur ce defaut : c'est le genre d'erreur qui
         ne se manifeste qu'en cron, donc en production.
+
+        Chaque option est prefixee de son `-o`, et c'est obligatoire.
+        `rsync` decoupe la valeur de `-e` sur les espaces et la passe a
+        un shell, donc
+
+            rsync -e "ssh ConnectTimeout=10 BatchMode=no"
+
+        fait de `ConnectTimeout=10` le **nom d'hote** a joindre, et
+        echoue sur « Could not resolve hostname connecttimeout=10 ».
+        L'erreur ne parle que de resolution de nom, alors que la cause
+        est une ligne de commande mal construite -- le genre de defaut
+        qui envoie vers le DNS alors que le probleme est ici.
         """
         argv = ["rsync", "-a", "--partial", "--timeout=120"]
-        if probe:
-            argv.append("--contimeout=30")
-        options = _merge_opts(ssh_opts, self.ssh_key)
+        # Aucun delai de connexion n'est ajoute ici. L'option qui le
+        # portait etait `--contimeout`, honoree par `rsync` face un
+        # **demon** seulement : en mode `rsync -e ssh` -- le seul que
+        # nous employons -- elle est refusee, et `rsync` echouait donc
+        # toujours. L'echec etait masque par le repli automatique vers
+        # `scp`, ce qui le rendait invisible.
+        #
+        # Le delai de connexion est desormais porte par `ConnectTimeout`
+        # dans les options SSH, que `_merge_opts` construit a partir de
+        # l'inventaire. Une sonde contre un hote injoignable echoue donc
+        # en 10 s, pas en 120.
+        options = _merge_opts(ssh_opts, self.ssh_password)
         if options:
-            argv.extend(["-e", "ssh " + " ".join(options)])
+            # `-o` devant chaque option, et non un seul `-o` suivi de
+            # toutes : `rsync` scinde la valeur de `-e` sur les espaces
+            # avant de la donner a un shell. Voir la note de version.
+            ssh = "ssh"
+            for opt in options:
+                ssh += " -o " + opt
+            argv.extend(["-e", ssh])
         argv.extend([
             f"{_hote(self.source)}:{PurePosixPath(src_dir) / name}",
             f"{PurePosixPath(dst_dir) / name}",
@@ -510,7 +605,7 @@ class TransferBackend:
                          "OpenSSH 9 sur le serveur de saut.",
                 )
             argv.append("-O")
-        for opt in _merge_opts(ssh_opts, self.ssh_key):
+        for opt in _merge_opts(ssh_opts, self.ssh_password):
             argv.extend(["-o", opt])
         argv.extend([
             f"{_hote(self.source)}:{PurePosixPath(src_dir) / name}",
@@ -531,13 +626,16 @@ class TransferBackend:
             f"get {PurePosixPath(src_dir) / name} "
             f"{PurePosixPath(dst_dir) / name}\nquit\n"
         )
-        argv = ["sftp", "-b", "-", "-o", "BatchMode=yes"]
-        if self.ssh_key:
-            argv.extend(["-i", self.ssh_key])
-        for opt in _merge_opts(ssh_opts, self.ssh_key):
-            if "BatchMode" not in opt:
-                argv.extend(["-o", opt])
+        # `BatchMode` vient de `_merge_opts`, qui l'a deja pose selon le
+        # mode d'authentification. Le poser en dur ici, puis sauter tout
+        # ce qui porte ce nom, rendait cette decision intouchable : en
+        # mode mot de passe, le `BatchMode=yes` initial interdisait
+        # l'authentification et le transfert echouait toujours.
+        argv = ["sftp", "-b", "-"]
+        for opt in _merge_opts(ssh_opts, self.ssh_password):
+            argv.extend(["-o", opt])
         argv.append(_hote(self.source))
+        argv = _prefixe_sshpass(self.ssh_password) + argv
         try:
             proc = _run_command(
                 argv,
@@ -546,6 +644,7 @@ class TransferBackend:
                 stderr=subprocess.PIPE,
                 timeout=_PROBE_TIMEOUT,
                 check=False,
+                env=_env_avec_mot_de_passe(self.ssh_password),
             )
         except FileNotFoundError:
             return False, "client sftp absent du serveur de saut"
@@ -673,9 +772,24 @@ def _hote(runner) -> str:
     `lstrip("@")` sans effet : un `user` vide produisait `@hote` dans une
     version et `hote` dans les deux autres. Le rapport indiquait alors
     un hote qui n'existe pas.
+
+    `transfer_host` et `transfer_user` priment sur `host` et `user` :
+    ils portent ce que **ces clients** doivent joindre, et non ce que
+    l'inventaire nomme. La distinction n'est pas academique : un nom
+    d'inventaire n'est resoluble que par Ansible, donc `scp osaix:...`
+    echouerait sur une resolution de nom alors que tout le run aurait
+    reussi. Un inventaire dont le nom est directement joignable -- une
+    adresse, un alias DNS -- donne la meme valeur des deux cotes, et
+    rien ne change.
+
+    L'utilisateur suit la meme regle : `ansible_user` designe le compte
+    d'exploitation de l'hote, qui n'est pas forcement celui du serveur de
+    saut.
     """
-    user = getattr(runner, "user", "") or ""
-    host = getattr(runner, "host", "")
+    host = getattr(runner, "transfer_host", None) or getattr(runner, "host", "")
+    user = getattr(runner, "transfer_user", None)
+    if user is None:
+        user = getattr(runner, "user", "") or ""
     return f"{user}@{host}" if user else host
 
 
@@ -707,19 +821,59 @@ def _scp_supports_legacy() -> bool:
     return re.search(r"(?m)^\s*-O\b", usage) is not None
 
 
-def _merge_opts(ssh_opts: Sequence[str], ssh_key: str) -> List[str]:
+def _opts_du_runner(runner) -> List[str]:
+    """Options SSH du runner, qu'il les expose en attribut ou en methode.
+
+    Le contrat a change avec le transport. `RemoteRunner` portait un
+    attribut `ssh_opts`, pose a la construction depuis la configuration.
+    `AnsibleRunner` lit l'inventaire a la demande, donc sa methode
+    `ssh_opts` declenche une lecture du coffre -- et la valeur n'est donc
+    pas connue a la construction.
+
+    Sans cette adaptation, `getattr(runner, "ssh_opts", [])` rendrait la
+    methode elle-meme, et la commande de transfert recevrait une liste
+    contenant un objet lie : aucune erreur, aucun transfert possible, et
+    un echec bien plus tardif a diagnostiquer. C'est le genre de defaut
+    qu'un test d'egalite de chaines ne revele pas ; d'ou un test sur la
+    commande rendue, qui est ce que voit reellement l'exploitant.
+    """
+    opts = getattr(runner, "ssh_opts", None)
+    if callable(opts):
+        try:
+            opts = opts()
+        except Exception:  # pragma: no cover - le runner rapporte lui-meme
+            return []
+    if isinstance(opts, str):
+        return [o for o in opts.split() if o]
+    if isinstance(opts, (list, tuple)):
+        return [str(o) for o in opts]
+    return []
+
+
+def _merge_opts(ssh_opts: Sequence[str], mot_de_passe: str = "") -> List[str]:
     """Assemble les options SSH en conservant un ordre deterministe.
 
-    `BatchMode=yes` est toujours ajoute : sans lui, une erreur
-    d'authentification provoquerait une invite interactive, et le run
-    resterait bloque jusqu'a l'expiration du crontab.
+    Le traitement de `BatchMode` depend du mode d'authentification, et
+    c'est deliberement l'inverse dans les deux cas :
+
+    * **par cle** (pas de mot de passe fourni) — `BatchMode=yes` est ajoute
+      comme toujours. Sans lui, une erreur d'authentification ouvrirait
+      une invite interactive, et le run resterait bloque jusqu'a
+      l'expiration du crontab. C'est la garantie d'origine.
+
+    * **par mot de passe** — `BatchMode` est pose a `no`, parce qu'il
+      interdit toute invite, donc toute saisie. Le blocage qu'il evitait
+      est alors prevenu par `NumberOfPasswordPrompts=1`, pose par
+      `_prefixe_sshpass` : `ssh` tente une fois, puis echoue. Le defaut
+      est le meme, le remede change.
     """
+    base = [o for o in ssh_opts if not o.strip().lower().startswith("batchmode")]
     # Toute variante de `BatchMode` est ecartee, pas seulement l'absence
-    # du mot-cle : voir la note de version. `BatchMode=no`_referait`
-    # exactement ce que cette fonction annonce empecher.
-    return [
-        o for o in ssh_opts if not o.strip().lower().startswith("batchmode")
-    ] + ["BatchMode=yes"]
+    # du mot-cle : `BatchMode=no` designerait exactement ce que cette
+    # fonction annonce empecher, en mode cle.
+    if mot_de_passe:
+        return base + ["BatchMode=no", "NumberOfPasswordPrompts=1"]
+    return base + ["BatchMode=yes"]
 
 
 def _classify_error(stderr: bytes) -> str:

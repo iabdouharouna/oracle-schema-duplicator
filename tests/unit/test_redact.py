@@ -116,7 +116,7 @@ class TestRobustesse(unittest.TestCase):
                 self.assertIsInstance(rd.redact(valeur), str)
 
     def test_texte_vide_ou_sans_secret_inchange(self):
-        for texte in ("", "expdp并行 PARALLEL=4", "aucun secret ici"):
+        for texte in ("", "expdp en parallele PARALLEL=4", "aucun secret ici"):
             with self.subTest(texte=texte):
                 self.assertEqual(rd.redact(texte), texte)
 

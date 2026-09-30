@@ -1,0 +1,44 @@
+# =====================================================================
+# Inventaire Ansible -- Oracle Schema Duplicator
+# =====================================================================
+#
+# Cet inventaire remplace les cles `SOURCE_HOST` / `TARGET_HOST` et la
+# cle `SSH_KEY` de la configuration de l'outil. Il est la seule autorite
+# sur *qui* est execute par SSH, et Ansible est l'unique voie
+# d'authentification : les mots de passe sont chiffres par Ansible Vault
+# et ne transitent jamais par la ligne de commande.
+#
+# Lancement (le mot de passe de coffre est fourni par l'ordonnanceur,
+# jamais dans un fichier de configuration) :
+#
+#     bin/osd run -c config/config.conf
+#
+# L'outil passe lui-meme `--inventory` et `--vault-password-file` a
+# Ansible, d'apres `OSD_INVENTORY` et `OSD_VAULT_PASSWORD_FILE`.
+#
+# ---------------------------------------------------------------------
+# Groupes
+# ---------------------------------------------------------------------
+#
+# `osd_source` et `osd_target` sont **distincts** par construction.
+# Renseigner le meme hote dans les deux groupes ne provoque pas une
+# erreur : cela reproduit la topologie `partage`, ou aucun transfert
+# n'a lieu, et le rapport l'indique. C'est un choix exploitant, pas une
+# faute de frappe silencieuse.
+#
+# Si un hote n'appartient a aucun des deux groupes, il n'est jamais
+# execute. La presence d'un troisieme groupe est sans effet ici.
+
+
+[osd_source]
+172.16.1.84 ansible_host=172.16.1.84
+
+[osd_target]
+172.16.1.82 ansible_host=172.16.1.82
+
+
+[osd_source:vars]
+ansible_user=oracle
+
+[osd_target:vars]
+ansible_user=oracle

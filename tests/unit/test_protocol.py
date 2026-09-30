@@ -45,7 +45,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import SRC_DIR
+from support import SRC_DIR, isoler_home
 
 from osd.runner import LocalRunner, build_script, load_body
 
@@ -64,6 +64,12 @@ class CasDeTest(unittest.TestCase):
         self.racine = Path(self.tmp.name)
         self.repertoire = self.racine / "dpdump"
         self.repertoire.mkdir()
+        # Les scripts sourcent le profil de connexion, pour retrouver le
+        # client Oracle du compte d'exploitation. Sans cette isolation,
+        # un `~/.profile` developpeur qui prepend `ORACLE_HOME/bin` au
+        # `PATH` ferait passer « client absent » au vert en executant le
+        # vrai client. Voir `support.isoler_home`.
+        isoler_home(self)
 
     def executer(self, nom: str, *args: str, timeout: int = 120, **kw):
         """Assemble puis execute un script distant, pour de vrai."""

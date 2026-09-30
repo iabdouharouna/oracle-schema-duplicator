@@ -56,12 +56,16 @@ src/osd/
   logging_setup.py          journalisation, un fichier par run
   lock.py                   exclusion mutuelle entre runs
   state.py                  état des 19 étapes, persistance, reprise
-  runner.py                 LocalRunner / RemoteRunner, exécution
+  runner.py                 LocalRunner / RemoteRunner, exécution, assemblage
   adapters/
+    ansible_runner.py       exécution distante par Ansible, inventaire, coffre
     oracle.py               connexion, SQL*Plus, DIRECTORY, requêtes
     datapump.py             expdp/impdp, parfiles, état des jobs
     transfer.py             choix et exécution du backend de transfert
     null.py                 NullRunner — la simulation
+inventory/
+  hosts                     qui est exécuté, et par quel compte
+  group_vars/all.yml        secret SSH, chiffré par Vault (non versionné)
   checks/preflight.py       les contrôles des étapes 3 à 9
   stages/pipeline.py        l'enchaînement des 19 étapes
   report/                   construction du document, rendu texte
@@ -128,15 +132,31 @@ traitement.
 
 Détail dans `docs/REMOTE_PROTOCOL.md`. En résumé :
 
-- le script complet part sur `stdin` : `ssh -o BatchMode=yes <hôte> sh -s` ;
-- assemblage dans cet ordre : environnement → prelude → amorçage → arguments →
-  corps. L'ordre est significatif, et les deux inversions possibles sont
+- l'exécution passe par **Ansible**, en simple transport :
+  `ansible <hôte> -i <inventaire> --vault-password-file <fichier> -m script`.
+  Ansible est l'infrastructure — coffre chiffré, inventaire, authentification —
+  et non l'automate : le pipeline reste responsable de l'ordre des 19 étapes ;
+- `ansible -m script` renvoie `rc=0` **même quand le script échoue**. Le code
+  réel est lu dans le bloc de résultat (`OSD_RESULT_END rc=n`) ; le `rc`
+  d'Ansible est ignoré. Un bloc sans `rc=` est rejeté comme incomplet, car un
+  bloc tronqué ne se distingue pas d'un succès ;
+- le script commence par **sourcer le profil** de l'hôte, après un `sh -n` de
+  contrôle. Ni Ansible ni `ssh` n'ouvrent de session de connexion, et le
+  `PATH` du compte d'exploitation — où vit `expdp` — n'y est pas ;
+- assemblage dans cet ordre : profil → environnement → prelude → amorçage →
+  arguments → corps. L'ordre est significatif, et les inversions possibles sont
   documentées dans `build_script` ;
 - `stdout` ne contient **que** du protocole. Le prelude redirige `stdout` vers
   `stderr` et conserve le vrai `stdout` sur le descripteur 3 : tout ce qui sort
   entre `OSD_ROWS_BEGIN` et `OSD_ROWS_END` doit être écrit `>&3` ;
 - `stderr` reçoit les diagnostics, donc la sortie de l'outil Oracle, traduite
   dans la locale de l'hôte — et donc inutilisable telle quelle.
+
+Le **transfert**, lui, reste hors Ansible : `scp`, `rsync` et `sftp` sont des
+clients du serveur de saut. C'est pourquoi `ansible_host`, `ansible_user` et
+`ansible_ssh_private_key_file` sont traduits en adresse, compte et
+`IdentityFile` : ces clients ignorent l'inventaire, et un nom d'inventaire n'a
+de sens que pour Ansible.
 
 `stdout` du processus `osd` lui-même porte **uniquement le rapport** ; les
 journaux vont sur `stderr`. Un ordonnanceur peut donc capturer le rapport sans y

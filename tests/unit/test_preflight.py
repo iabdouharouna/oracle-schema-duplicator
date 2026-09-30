@@ -751,7 +751,7 @@ class TestRendu(unittest.TestCase):
     def test_le_remede_n_apparait_qu_en_cas_de_probleme(self):
         """Un remediation sur un controle reussi est du bruit.
 
-        Le rapport liste une绝对不是-quarante controles : afficher une
+        Le rapport liste une/quarante controles : afficher une
         ligne « remed(e) » sous chaque `OK` noierait l'information utile.
         """
         ok = preflight.CheckResult("a", status=OK, hint="inutile ici")

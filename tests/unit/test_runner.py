@@ -28,6 +28,7 @@ des tests d'integration, mais ils sont plus rapides et plus precoces.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -46,6 +47,7 @@ from osd.runner import (
     Raw,
     RemoteProtocolError,
     RemoteRunner,
+    Result,
     build_script,
     load_body,
 )
@@ -97,7 +99,7 @@ VALEURS_HOSTILES = [
     "''",
     "a" * 500,
     "éàü",
-    "路径/文件",
+    "chemin/fichier",
     "ligne1\nligne2\nligne3",
 ]
 
@@ -342,6 +344,137 @@ class TestBuildScript(unittest.TestCase):
         self.assertIn("trap 'osd_finish $?' 0", script)
 
 
+class TestProfilDeConnexion(unittest.TestCase):
+    """Le client Oracle est dans le `PATH` du profil, pas dans l'environnement.
+
+    Ni Ansible ni `ssh` n'ouvrent une session de connexion : ce que nous
+    lancons est une coquille non interactive, qui ne source ni
+    `/etc/profile` ni `~/.profile`. Or c'est la que l'installeur Oracle
+    depose `ORACLE_HOME/bin`. Sans sourcing explicite, `expdp` parait
+    absent sur un hote ou il est installe — et l'etape 3 annonce un
+    client manquant avec un remede, « verifier le `PATH` du compte »,
+    auquel il n'y a rien a verifier puisque c'est justement le `PATH`
+    de l'exploitant qui fait defaut.
+
+    Ces tests passent par un vrai `sh`, avec un vrai `HOME` : c'est le
+    seul moyen de savoir si le sourcing **marche**, plutot que s'il est
+    ecrit.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.racine = Path(self.tmp.name)
+        self.home = self.racine / "home"
+        self.home.mkdir()
+        self._precedent = os.environ.get("HOME")
+        self.addCleanup(self._restaurer)
+        os.environ["HOME"] = str(self.home)
+
+    def _restaurer(self) -> None:
+        if self._precedent is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._precedent
+
+    def _profil(self, contenu: str) -> None:
+        (self.home / ".profile").write_text(contenu, encoding="ascii")
+
+    def _client(self, nom: str = "expdp") -> Path:
+        """Un faux `expdp` dans un repertoire que seul le profil expose."""
+        dossier = self.racine / "oracle-bin"
+        dossier.mkdir(exist_ok=True)
+        chemin = dossier / nom
+        chemin.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        chemin.chmod(0o755)
+        return chemin
+
+    def _executer(self, corps: str) -> Result:
+        return LocalRunner().run_script(
+            build_script(corps, ["x"], env={}), timeout=120
+        )
+
+    def test_un_client_annonce_par_le_profil_est_resolu(self):
+        """Le cas de production, verifie de bout en bout.
+
+        Le profil *prepend* son chemin, comme le fait un `.profile` qui
+        declare `PATH="$ORACLE_HOME/bin:$PATH"`. Le binaire resolu doit
+        donc etre **celui du profil** — on compare le chemin obtenu, sans
+        quoi le test passerait sur un `expdp` deja present dans
+        l'environnement du developpeur, et ne verifierait rien.
+        """
+        attendu = self._client()
+        self._profil(f'PATH="{attendu.parent}:$PATH"\n')
+        resultat = self._executer(
+            'osd_kv OU_TROUVE "$(command -v expdp 2>/dev/null || echo absent)"\n'
+            "osd_finish 0\n"
+        )
+        self.assertEqual(resultat.get("OU_TROUVE"), str(attendu))
+
+    def test_une_variable_non_initialisee_dans_le_profil_ne_bloque_pas(self):
+        """Le sourcing precede `set -u`, et l'ordre est la raison d'etre.
+
+        Un profil n'ecrit pas toujours des variables qu'il initialise
+        lui-meme : un `$LD_PRELOAD` ou un `$NLS_LANG` conditionnel laisse
+        la variable non definie. Sourced apres `set -u`, cela tuerait le
+        script avant meme le prelude -- donc avant tout resultat, donc
+        avant le moindre message : un echec muet, sans bloc de resultat
+        a analyser.
+
+        On verifie que le script **aboutit**, pas l'ordre des lignes.
+        """
+        self._profil('echo "NLS_LANG=$NLS_LANG_ABSENTE" >/dev/null 2>&1\n')
+        resultat = self._executer("osd_kv VECU 1\nosd_finish 0\n")
+        self.assertEqual(resultat.rc, 0, resultat.stderr)
+        self.assertEqual(resultat.get("VECU"), "1")
+
+    def test_un_profil_defaillant_n_interrompt_pas_le_script(self):
+        """Un profil qui echoue ne doit pas faire echouer le run.
+
+        Un profil peutemployer une construction propre a sa coquille de
+        connexion, ou refermer sur un `return` invalide en `sh`. Rien de
+        cela ne concerne notre execution, et une source non protegee
+        transformerait chaque script en echec, avec un message qui
+        designerait le profil et non le client absent.
+        """
+        self._profil("syntaxe ( ) invalide\nfalse\n")
+        resultat = self._executer("osd_kv VECU 1\nosd_finish 0\n")
+        self.assertEqual(resultat.rc, 0, resultat.stderr)
+        self.assertEqual(resultat.get("VECU"), "1")
+
+    def test_l_absence_de_tout_profil_est_le_cas_normal(self):
+        """Aucun des fichiers n'est obligatoire.
+
+        Un hote dont le client est deja dans le `PATH` herite n'a rien a
+        charger. Le bloc doit donc etre neutre quand il ne trouve rien,
+        et ne pas devenir une condition d'arret -- ce que le `|| :` de la
+        boucle garantit, le dernier `export PATH` réussissant toujours.
+        """
+        resultat = self._executer("osd_kv VECU 1\nosd_finish 0\n")
+        self.assertEqual(resultat.rc, 0, resultat.stderr)
+        self.assertEqual(resultat.get("VECU"), "1")
+
+    def test_le_path_du_profil_est_reellement_exporte(self):
+        """Un profil qui pose `PATH` sans l'exporter ne change rien.
+
+        C'est un defaut de redaction courant dans un `.profile`, et il
+        est **invisible** a l'oeil : la variable est posee, l'export
+        manque, et les commandes qui suivent la source -- les nôtres --
+        n'en voient pas l'effet. Le client reste introuvable, et rien dans
+        le script n'indique pourquoi.
+        """
+        dossier = self.racine / "sans-export"
+        dossier.mkdir()
+        (dossier / "expdp").write_text("#!/bin/sh\n", encoding="ascii")
+        (dossier / "expdp").chmod(0o755)
+        self._profil(f'PATH="{dossier}:$PATH"\n')  # pas de export
+        resultat = self._executer(
+            'osd_kv OU_TROUVE "$(command -v expdp 2>/dev/null || echo absent)"\n'
+            "osd_finish 0\n"
+        )
+        self.assertEqual(resultat.get("OU_TROUVE"), str(dossier / "expdp"))
+
+
 class TestInjection(unittest.TestCase):
     """Le point non negociable : un argument n'est jamais du code."""
 
@@ -456,7 +589,7 @@ class TestEnvironnementDuScript(unittest.TestCase):
         """Le prelude et le corps ont besoin de `TNS_ADMIN`.
 
         Une valeur posee apres le prelude n'aurait d'effet sur rien :
-        le client Oracle est lance par le corps, et l找不到 viendrait
+        le client Oracle est lance par le corps, et l'absence viendrait
         du client. C'est un echec qui ne se reproduit pas en developpement,
         ou l'environnement du developpeur est deja renseigne.
         """

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -197,6 +198,65 @@ class FakeRunner:
 
 
 # --------------------------------------------------------------------------
+# Isolation du profil de connexion
+# --------------------------------------------------------------------------
+
+#: Repertoire vide qui remplace `HOME` pendant un test.
+#:
+#: Il ne doit contenir **aucun** fichier `.profile`, `.profile.ksh` ni
+#: `.login` : c'est l'absence de ces fichiers qui rend le sourcing inerte.
+_HOMES_VIDES: List[str] = []
+
+
+def isoler_home(cas: Any) -> str:
+    """Detourne `HOME` vers un repertoire vide, jusqu'à la fin du test.
+
+    Les scripts generes sourcent le profil de connexion -- `/etc/profile`,
+    puis `~/.profile` -- parce qu'un client Oracle sur AIX est dans le
+    `PATH` du compte d'exploitation, pose par ces fichiers, et qu'une
+    coquille non interactive ne les source pas d'elle-meme. C'est le
+    comportement voulu en exploitation, et un test qui l'ignore mesure
+    autre chose.
+
+    Le piege est d'une nature deja connue de cette suite : un test qui
+    depend de son environnement. Ici, le developpeur dont `~/.profile`
+    declare `ORACLE_HOME` voit ses tests « client absent » passer au vert
+    en executant le **vrai** client, et ses faux clients Data Pump se
+    retrouver derriere lui -- un profil qui *prepend* son chemin a
+    `PATH` suffit a les repousser. Le developpeur voit un vert,
+    l'integration voit un 127 : exactement l'echec que
+    `path_sans_client_reel` (test_datapump.py) existe pour empecher.
+
+    `HOME` ne rend donc pas sa valeur a un `mock.patch.dict` : le test
+    doit pouvoir heriter de la restauration, et un gestionnaire de
+    contexte imbrique ici masquerait la vraie cause d'un `Path` absent
+    plus loin.
+
+    Reserve a `/etc/profile` : le neutraliser demanderait d'ecrire dans
+    un fichier systeme, ce qu'un test n'a pas le droit de faire. Un hote
+    qui y declarerait `ORACLE_HOME` resterait donc contaminant, mais c'est
+    aussi un hote ou `path_sans_client_reel` doit etre elargi. Le siege
+    n'est pas change.
+    """
+    if not _HOMES_VIDES:
+        racine = tempfile.mkdtemp(prefix="osd-home-")
+        os.chmod(racine, 0o700)
+        _HOMES_VIDES.append(racine)
+    home = _HOMES_VIDES[0]
+    precedent = os.environ.get("HOME")
+    cas.addCleanup(_restaurer_home, precedent)
+    os.environ["HOME"] = home
+    return home
+
+
+def _restaurer_home(precedent: Optional[str]) -> None:
+    if precedent is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = precedent
+
+
+# --------------------------------------------------------------------------
 # Configuration de test
 # --------------------------------------------------------------------------
 
@@ -229,8 +289,58 @@ def overrides(**extra: Any) -> Dict[str, str]:
     return out
 
 
+#: Inventaire et mot de passe de coffre employes par les tests.
+#:
+#: Ils sont crees a la demande et partages : la validation de la
+#: configuration **exige** leur existence des qu'un hote est designe,
+#: donc toute configuration de test qui pose `SOURCE_HOST` doit pouvoir
+#: les fournir. Les creer ici evite que chaque test distant doive
+#: reproduce la mise en place -- et surtout evite 185 echecs issus d'une
+#: seule cause, ce qui masque la cause reelle quand elle existe.
+#:
+#: Le contenu est sans importance : aucun test n'authentifie reellement.
+#: Ce qui compte est que les fichiers existent, sont lisibles, et que le
+#: mot de passe de coffre est en 0600 -- le mode que la validation
+#: controle.
+_TRANSPORT: Dict[str, str] = {}
+
+
+def _transport() -> Dict[str, str]:
+    """Prepare l'inventaire Ansible et le coffre, une fois pour toutes."""
+    if _TRANSPORT:
+        return _TRANSPORT
+    racine = Path(tempfile.mkdtemp(prefix="osd-transport-"))
+    inventaire = racine / "hosts"
+    inventaire.write_text(
+        "source.exemple ansible_connection=local\n"
+        "cible.exemple ansible_connection=local\n",
+        encoding="utf-8",
+    )
+    coffre = racine / "vault-pass"
+    coffre.write_text("mot-de-passe-de-test\n", encoding="utf-8")
+    os.chmod(coffre, 0o600)
+    _TRANSPORT.update(
+        OSD_INVENTORY=str(inventaire),
+        OSD_VAULT_PASSWORD_FILE=str(coffre),
+    )
+    return _TRANSPORT
+
+
 def load_config(**extra: Any):
-    """Charge une configuration valide completee par `extra`."""
+    """Charge une configuration valide completee par `extra`.
+
+    Les surcharges de l'appelant priment sur celles de `extra`, sans quoi
+    un test ne pourrait pas remplacer l'inventaire par un chemin qu'il
+    controle -- ce dont plusieurs tests de validation ont besoin pour
+    verifier le refus d'un inventaire absent.
+    """
     from osd import config as config_mod
 
-    return config_mod.load(None, overrides=overrides(**extra))
+    base = dict(BASE_OVERRIDES)
+    if any(key.endswith("_HOST") and value for key, value in extra.items()):
+        # L'inventaire n'a de sens qu'avec un hote : le poser en
+        # permanence masquerait le test « hote designe mais inventaire
+        # absent », qui verifie précisément ce refus.
+        base.update(_transport())
+    base.update(overrides(**extra))
+    return config_mod.load(None, overrides=base)

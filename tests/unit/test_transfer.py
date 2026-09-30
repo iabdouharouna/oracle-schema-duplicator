@@ -253,13 +253,22 @@ def backend(
     target: Optional[RunnerFaux] = None,
     mode: str = "auto",
     cache: Optional[Path] = None,
-    ssh_key: str = "",
+    ssh_password: str = "",
 ) -> TransferBackend:
+    """Construit un `TransferBackend` sur deux faux hotes.
+
+    `ssh_password` est expose parce que le comportement du transfert
+    differe selon le mode d'authentification : par cle, `BatchMode=yes`
+    bloque toute invite ; par mot de passe, il faut au contraire
+    l'autoriser et poser `NumberOfPasswordPrompts=1`. Les deux branches
+    meritent d'etre exercees, faute de quoi la seconde ne serait
+    testee que par le chemin reel, sur une machine de l'exploitant.
+    """
     return TransferBackend(
         source_runner=source or RunnerFaux(label="source", host="src.exemple"),
         target_runner=target or RunnerFaux(label="cible", host="tgt.exemple"),
         mode=mode,
-        ssh_key=ssh_key,
+        ssh_password=ssh_password,
         probe_cache_dir=cache,
     )
 
@@ -668,7 +677,7 @@ class TestLignesDeCommande(unittest.TestCase):
         des reglages poses.
         """
         self.source.ssh_opts = ["ConnectTimeout=30", "StrictHostKeyChecking=yes"]
-        argv = self.be._rsync_command("/src", "/dst", "f.dmp", self.source.ssh_opts, False)
+        argv = self.be._rsync_command("/src", "/dst", "f.dmp", self.source.ssh_opts)
         self.assertEqual(argv.count("-e"), 1, argv)
         valeur = argv[argv.index("-e") + 1]
         self.assertTrue(valeur.startswith("ssh "), valeur)
@@ -682,12 +691,35 @@ class TestLignesDeCommande(unittest.TestCase):
         alors qu'aucun choix n'a ete fait — et la ligne de commande est
         justement ce que l'on copie dans un ticket.
         """
-        argv = self.be._rsync_command("/src", "/dst", "f.dmp", [], False)
+        argv = self.be._rsync_command("/src", "/dst", "f.dmp", [])
         # `BatchMode` est toujours ajoute, donc `-e` reste present ; le
         # controle porte sur l'absence d'option vide.
         self.assertNotIn("", argv)
         valeur = argv[argv.index("-e") + 1]
-        self.assertEqual(valeur, "ssh BatchMode=yes")
+        self.assertEqual(valeur, "ssh -o BatchMode=yes")
+
+    def test_rsync_prefixe_chaque_option_par_son_o(self):
+        """`rsync` scinde la valeur de `-e` sur les espaces.
+
+        C'est le point qui a rendu `rsync` inutilisable en mode distant,
+        et le defaut etait invisible : l'echec « Could not resolve
+        hostname connecttimeout=10 » ne parle que de resolution de nom,
+        alors que la cause est une ligne de commande mal construite. Le
+        repli automatique vers `scp` le rendait de surcroi invisible.
+
+        Le test porte sur la **forme exacte**, parce que c'est elle que
+        `rsync` decoupe : `ssh`, puis autant de paires `-o`/`valeur`
+        qu'il y a d'options, sans quoi le premier mot apres `ssh` est
+        pris pour le nom d'hote.
+        """
+        self.source.ssh_opts = ["ConnectTimeout=30", "StrictHostKeyChecking=yes"]
+        argv = self.be._rsync_command("/src", "/dst", "f.dmp", self.source.ssh_opts)
+        mots = argv[argv.index("-e") + 1].split()
+        self.assertEqual(mots[0], "ssh")
+        self.assertEqual(mots[1::2], ["-o"] * (len(mots[1:]) // 2), mots)
+        # Aucun mot nu ne peut donc etre pris pour un nom d'hote.
+        for mot in mots[2::2]:
+            self.assertIn("=", mot, f"option sans valeur : {mot}")
 
     def test_scp_et_sftp_posent_une_option_par_occurrence(self):
         """`-o` se repete legitimement, contrairement a `-e`.
@@ -797,7 +829,7 @@ class TestLignesDeCommande(unittest.TestCase):
         self.assertEqual(_hote(source), "src.exemple")
         argv = be._scp_command("/src", "/dst", "f.dmp", [], legacy=False)
         self.assertNotIn("@", argv[-2])
-        argv = be._rsync_command("/src", "/dst", "f.dmp", [], False)
+        argv = be._rsync_command("/src", "/dst", "f.dmp", [])
         self.assertNotIn("@", argv[-2])
 
     def test_le_chemin_distant_est_construit_avec_une_barre(self):
@@ -819,20 +851,42 @@ class TestLignesDeCommande(unittest.TestCase):
         zero ; l'exploitant finit par declencher le transfert la nuit,
         et le retour d'information d'un seul echec.
         """
-        argv = self.be._rsync_command("/src", "/dst", "f.dmp", [], probe=False)
+        argv = self.be._rsync_command("/src", "/dst", "f.dmp", [])
         self.assertIn("--partial", argv)
 
-    def test_la_sonde_a_un_delai_plus_court_que_le_transfert(self):
-        """Un delai de production sur une sonde est un mauvais calcul.
+    def test_rsync_ne_recoit_aucune_option_reservee_au_demon(self):
+        """`--contimeout` n'a de sens que face un demon rsync.
 
-        La sonde est rejouee a chaque tentative de chaque run : lui
-        donner le meme delai que le transfert reel ferait perdre plus
-        de temps a diagnostiquer un mecanisme qu'a transferer le dump.
+        En mode `rsync -e ssh` -- le seul que nous employons -- `rsync`
+        **refuse** l'option et echoue : c'est ce qui rendait le backend
+        `rsync` inutilisable, l'echec etant ensuite masque par le repli
+        automatique vers `scp`. Le test porte sur la commande rendue,
+        parce que c'est la seule forme que `rsync` verra.
+
+        Le delai de connexion est reporte sur `ConnectTimeout`, dans les
+        options SSH : une sonde contre un hote injoignable echoue en
+        10 s et non en 120.
         """
-        with_ = self.be._rsync_command("/s", "/d", "f", [], probe=True)
-        without = self.be._rsync_command("/s", "/d", "f", [], probe=False)
-        self.assertIn("--contimeout=30", with_)
-        self.assertNotIn("--contimeout=30", without)
+        argv = self.be._rsync_command("/s", "/d", "f", ["ConnectTimeout=10"])
+        self.assertNotIn("--contimeout=30", argv)
+        for element in argv:
+            self.assertFalse(
+                element.startswith("--contimeout"),
+                "option reservee au demon rsync dans une commande ssh",
+            )
+        # Le delai borne est bien present, par la voie qui fonctionne.
+        self.assertIn("ConnectTimeout=10", " ".join(argv))
+
+    def test_le_delai_de_connexion_vient_des_options_inventaire(self):
+        """Sans option d'inventaire, `rsync` n'a pas de borne de connexion.
+
+        Ce n'est pas une regression : l'inventaire fournit
+        `ConnectTimeout=10` par defaut, et `_merge_opts` le conserve. Le
+        test le fixe pour qu'un retrait futur de cette option soit vu.
+        """
+        from osd.adapters import transfer as module
+
+        self.assertIn("ConnectTimeout=10", module._merge_opts(["ConnectTimeout=10"], ""))
 
 
 class TestRetenueEnDryRun(unittest.TestCase):
@@ -1185,7 +1239,7 @@ class TestCompteRendu(unittest.TestCase):
         self.assertEqual(outcome.to_dict()["backend"], "scp-legacy")
 
     def test_le_compte_rendu_ne_contient_que_des_champs_connus(self):
-        """Un rapport versionne ne doit pas_regex 见 deborder de champ.
+        """Un rapport versionne ne doit pas deborder de champ.
 
         Un lecteur — tableau de bord, script de supervision — ne peut
         pas anticiper une cle qu'il n'a jamais vue. Le test fige la

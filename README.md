@@ -8,17 +8,18 @@ Data Pump, pilotée depuis un **serveur de saut** Linux.
 ```
   serveur de saut (Linux)                 base source (AIX)        base cible (AIX)
   ┌───────────────────────┐               ┌──────────────┐        ┌──────────────┐
-  │ python3  bin/osd      │  ssh          │ expdp        │        │ impdp        │
+  │ python3  bin/osd      │  ansible      │ expdp        │        │ impdp        │
   │ (aucun client Oracle) │ ───────────►  │ DIRECTORY    │        │ DIRECTORY    │
   │                       │ ◄───────────  │ tablespaces  │        │ tablespaces  │
   │ 19 etapes             │   résultats   │ privileges   │        │ privileges   │
   │ rapport + code 0..9   │               └──────────────┘        └──────────────┘
-  └───────────────────────┘                     dump  ──────────────►
+  └───────────────────────┘                     dump  ────rsync/scp──►
 ```
 
 Le serveur de saut **n'a pas de client Oracle** et n'en a pas besoin : il
 décide et compare, il ne lit pas la base. Tout ce qui exige le client
-s'exécute chez la base, par `ssh`.
+s'exécute chez la base, par Ansible, qui n'est ici qu'un **transport** : le
+protocole, l'ordre des étapes et les jugements restent dans le programme.
 
 ## Démarrage
 
@@ -26,9 +27,19 @@ s'exécute chez la base, par `ssh`.
 cp config/config.example.conf config/config.conf
 $EDITOR config/config.conf
 
+# l'inventaire décide qui est exécuté ; son secret est chiffré par Vault
+cp inventory/group_vars/all.yml.example inventory/group_vars/all.yml
+$EDITOR inventory/group_vars/all.yml
+install -m 600 /dev/null /etc/osd/vault-pass && $EDITOR /etc/osd/vault-pass
+ansible-vault encrypt inventory/group_vars/all.yml
+
 ./bin/osd check -c config/config.conf    # etapes 1 a 9, n'ecrit rien
 ./bin/osd run   -c config/config.conf    # le run complet
 ```
+
+`OSD_INVENTORY` et `OSD_VAULT_PASSWORD_FILE` dans `config.conf` pointent vers
+ces deux fichiers. La procédure complète, et la rotation des secrets, sont dans
+`docs/OPERATIONS.md`.
 
 Le schéma de configuration s'affiche par `./bin/osd config`.
 

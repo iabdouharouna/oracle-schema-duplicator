@@ -1,0 +1,106 @@
+# =====================================================================
+# Variables Ansible -- Oracle Schema Duplicator
+# =====================================================================
+#
+# Ce fichier sera **chiffre par Ansible Vault** :
+#
+#     ansible-vault encrypt group_vars/all.yml
+#
+# Il n'est donc pas versionne en clair. Le gabarit non chiffre, lui, est
+# versionne (`group_vars/all.yml.example`) pour que la structure soit
+# lisible sans le dechiffrer.
+#
+# ---------------------------------------------------------------------
+# Ce que le coffre protege, et ce qu'il ne protege pas
+# ---------------------------------------------------------------------
+#
+# Vault chiffre les mots de passe **SSH** : ceux avec lesquels on entre
+# sur les hotes AIX. C'est sa seule fonction ici.
+#
+# Il ne protege **pas** les mots de passe Oracle. La connexion aux
+# bases passe par un **wallet** (`SOURCE_WALLET` / `TARGET_WALLET` dans
+# la configuration de l'outil), dont le secret ne transite ni par Ansible
+# ni par l'outil. Confondre les deux serait une erreur de securite :
+# un `ansible_password` dechiffre ne donne acces qu'a la machine, pas a
+# la base.
+#
+# Consequence : si le wallet est indisponible sur un hote, il ne faut
+# **pas** ajouter `SOURCE_PASSWORD` ici pour depanner. Ce serait
+# reconduire dans Ansible un secret qui n'a rien a y faire, et qui
+# apparaitrait alors dans les arguments de processus de `expdp`.
+
+
+# ---------------------------------------------------------------------
+# Authentification SSH
+# ---------------------------------------------------------------------
+#
+# `ansible_password` est lu par le plugin SSH d'Ansible, qui appelle
+# `sshpass`. C'est ce qui permet de se passer de cle privee -- et ce qui
+# impose de **retirer** `BatchMode` : cette option interdit toute invite
+# de mot de passe, donc aucune authentification par mot de passe n'est
+# possible.
+#
+# Le mot de passe n'apparait dans **aucun** argument de processus :
+# Ansible le transmet via l'environnement, pas via `-p`.
+#
+# Le dechiffrement se fait avec un mot de passe de coffre distinct
+# (`OSD_VAULT_PASSWORD_FILE`), lui-meme hors du depot, en 0600.
+
+
+# Mot de passe SSH du compte d'exploitation des deux hotes.
+ansible_password: "A_REMPLACER_mot_de_passe_ssh"
+
+
+# ---------------------------------------------------------------------
+# Securite de la connexion
+# ---------------------------------------------------------------------
+#
+# Valeurs identiques a celles imposees par le projet hors Ansible, et
+# pour les memes raisons.
+#
+#   ConnectTimeout   un hote injoignable doit echouer vite : sous cron,
+#                    une attente sans borne retarde le job suivant sans
+#                    laisser de trace exploitable.
+#   StrictHostKeyChecking  on verifie la cle de l'hote. `accept-new`
+#                    accepte une cle inconnue mais refuse une cle
+#                    **changee**, ce qui est le cas qui doit alerter.
+#
+# A noter : `accept-new` signifie que la premiere connexion n'est pas
+# verifiee. Pour une verification stricte, remplacer par `yes` -- mais
+# alors `ansible` echoue tant que l'hote n'est pas dans `known_hosts`.
+
+ansible_ssh_common_args: >-
+  -o ConnectTimeout=10
+  -o StrictHostKeyChecking=accept-new
+
+# Empeche `ansible` de lire `~/.ssh/config` et `known_hosts` de
+# l'utilisateur, pour que le resultat ne depende pas de l'etat du poste
+# qui lance le run. Sous cron, HOME n'est pas toujours defini.
+#
+# Attention : cette variable n'est **pas** reprise pour le transfert de
+# l'etape 13, qui passe par `scp`, `rsync` ou `sftp` — des clients du
+# serveur de saut, donc hors d'Ansible. Un `-i` pose ici serait lu par
+# Ansible et ignore par le transfert, qui echouerait ensuite sur une
+# authentification sans lien visible avec sa cause. La cle a donc sa
+# propre variable, ci-dessous.
+ansible_ssh_args: "-C -o ControlMaster=auto -o ControlPersist=60"
+
+
+# ---------------------------------------------------------------------
+# Authentification par cle privee
+# ---------------------------------------------------------------------
+#
+# Alternative a `ansible_password` ci-dessus : une ou l'autre, pas les
+# deux.
+#
+# Le defaut d'une cle mal placee est decouvert **tard, et pour la pire
+# raison** : les douze premieres etapes se franchise, dont l'export de
+# l'etape 11, la plus longue du run, puis la copie echoue. Ansible ouvre
+# la session et le transfert la referme : les deux doivent disposer de la
+# meme cle, et elle n'est lue que d'ici.
+#
+# Le fichier doit etre hors du depot, en 0600, lisible par le compte qui
+# lance le run.
+
+
+# ansible_ssh_private_key_file: /etc/osd/id_ed25519

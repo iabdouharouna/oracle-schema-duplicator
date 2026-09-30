@@ -2,9 +2,9 @@
 
 ## Où s'exécute quoi
 
-| Où Quoi |
-|---------|--------|
-| Serveur de saut (Linux) | Python 3.9+, `ssh`, `scp`/`rsync`/`sftp`. **Pas de client Oracle.** |
+| Où | Quoi |
+|----|------|
+| Serveur de saut (Linux) | Python 3.9+, `ansible`, `ssh`, `scp`/`rsync`/`sftp`. **Pas de client Oracle.** |
 | Hôte AIX de la base | Oracle Client 19c, `sqlplus`, `expdp`, `impdp`, `sshd`. Pas de Python. |
 
 `bin/osd` se lance sur le serveur de saut. Il ne lit jamais la base : il décide
@@ -14,16 +14,90 @@ et compare, et confie toute lecture au client Oracle de l'hôte concerné.
 
 ```sh
 which sqlplus expdp impdp sh awk     # exigés
-# sshd doit accepter BatchMode + clé (voir plus bas)
+# sshd doit accepter l'authentification retenue par l'inventaire
 ```
+
+Ce `which` doit être exécuté **dans les conditions du run**. Ni Ansible ni
+`ssh` n'ouvrent de session de connexion, et le `PATH` du compte
+d'exploitation — où l'installeur Oracle dépose `ORACLE_HOME/bin` — n'est donc
+pas chargé. L'outil le source lui-même, au début de chaque script ; sans lui,
+le contrôle annoncerait un client absent sur un hôte où il est installé. Voir
+`docs/REMOTE_PROTOCOL.md`.
 
 Le compte SSH du serveur de saut doit avoir :
 
-- une clé publique dans `~/.ssh/authorized_keys` ;
 - l'accès en lecture/écriture au répertoire du `DIRECTORY` Data Pump, via
   l'écriture par `expdp` (le dump n'est pas lisible par `scp` autrement) ;
-- `BatchMode` accepté — sans quoi une erreur d'authentification ouvre une
-  invite et le run reste bloqué jusqu'à l'expiration du crontab.
+- l'authentification retenue par l'inventaire : clé privée, ou mot de passe
+  chiffré par Vault.
+
+## Inventaire et coffre
+
+C'est l'inventaire qui décide **qui** est exécuté, et par quel compte. Il
+remplace les clés `SSH_KEY` et `*_SSH_USER` de la configuration, qui sont
+refusées si elles portent une valeur.
+
+| Clé de configuration | Rôle |
+|----------------------|------|
+| `OSD_INVENTORY` | fichier d'inventaire Ansible (défaut `inventory/hosts`) |
+| `OSD_VAULT_PASSWORD_FILE` | mot de passe qui déchiffre le coffre, hors dépôt, en `0600` |
+
+Mise en place, une seule fois par serveur de saut :
+
+```sh
+# 1. le gabarit, versionné et lisible sans déchiffrer
+cp inventory/group_vars/all.yml.example inventory/group_vars/all.yml
+$EDITOR inventory/group_vars/all.yml          # ansible_password ou la clé
+
+# 2. le mot de passe du coffre, hors du dépôt
+install -m 600 /dev/null /etc/osd/vault-pass
+$EDITOR /etc/osd/vault-pass
+
+# 3. le chiffrement
+ansible-vault encrypt inventory/group_vars/all.yml
+```
+
+Ordre impératif : le mot de passe de coffre ne doit pas être créé *après* le
+chiffrement, sinon le premier `run` échoue sur un déchiffrement, et le message
+— « ciphertext password verification failed » — ne dit pas que le fichier
+n'existe pas encore.
+
+Vérification avant le premier run réel :
+
+```sh
+ansible osd_source -i inventory/hosts --vault-password-file /etc/osd/vault-pass \
+       -m debug -a 'msg={{ ansible_user | default("") }}'
+```
+
+Cette commande teste exactement ce que l'outil fera : elle doit renvoyer le
+compte, pas une erreur.
+
+### Rotation du secret SSH
+
+```sh
+ansible-vault edit inventory/group_vars/all.yml   # changer ansible_password
+ansible all -i inventory/hosts --vault-password-file /etc/osd/vault-pass \
+           -m ping
+```
+
+Si le compte est verrouillé ou la clé révoquée,
+`ansible ... -m ping` échoue en quelques secondes. Le faire **avant** de changer
+le mot de passe sur les deux hôtes évite l'inverse : un hôte mis à jour, l'autre
+non, et un run qui réussit sur l'un et échoue sur l'autre — sans que rien dans
+le rapport ne dise lequel des deux est en retard.
+
+### Rotation du mot de passe de coffre
+
+```sh
+ansible-vault rekey --new-vault-password-file /tmp/nouveau \
+                    --vault-password-file /etc/osd/vault-pass \
+                    inventory/group_vars/all.yml
+install -m 600 /tmp/nouveau /etc/osd/vault-pass && shred -u /tmp/nouveau
+```
+
+`rekey` chiffre à nouveau avec la **même** clé de contenu : seul change le
+vocabulaire de chiffrement. Sans cette étape, changer le mot de passe seul rend
+le fichier indéchiffrable, et le run échoue sur le premier hôte.
 
 ## Connexion Oracle
 
@@ -152,7 +226,13 @@ exactement l'erreur que la simulation doit éviter.
 Points vérifiés pour cet usage :
 
 - `--set` et `-c` sont lus, jamais exécutés ;
-- `BatchMode=yes` est garanti par la validation, donc aucun dialogue possible ;
+- `BatchMode=yes` est garanti par la validation en mode clé, donc aucun
+  dialogue possible. En mode mot de passe, il est **retiré** de l'inventaire et
+  remplacé par `NumberOfPasswordPrompts=1` : `BatchMode` et le mot de passe
+  sont mutuellement exclusifs, et garder les deux ferait échouer toute
+  authentification par mot de passe ;
+- le secret transite par l'environnement (`SSHPASS`), jamais par `-p`, donc
+  jamais dans la table des processus ;
 - le verrou (`LOCK_DIR`) empêche deux runs concurrents ; `LOCK_DIR` doit être
   **local**, pas NFS — `fcntl` sur NFS n'est pas fiable ;
 - le rapport et le journal sont horodatés : plusieurs runs ne s'écrasent pas ;
@@ -160,6 +240,22 @@ Points vérifiés pour cet usage :
 
 `TRANSFER_MODE=AUTO` sonde les backends à chaque run (sonde d'une heure) : un
 `sshd` reconfiguré entre deux runs ne peut pas provoquer un échec inexpliqué.
+
+L'environnement du run est réduit à ce qu'Ansible exige :
+
+```
+ANSIBLE_FORCE_COLOR=0   ANSIBLE_NOCOLOR=1   ANSIBLE_RETRY_FILES_ENABLED=0
+```
+
+`ANSIBLE_NOCOLOR` n'est pas là pour la lisibilité seulement. Une séquence
+d'échappement insérée dans la sortie de `debug` -- donc dans le mot de passe lu
+pour le transfert -- le corromprait silencieusement. `HOME` est conservé, parce
+que c'est là qu'Ansible cherche `~/.ansible/cp`, sans quoi chaque appel recrée
+un contexte.
+
+`LC_ALL` n'est pas forcé : Ansible 2.14 refuse un `LC_ALL=C` transmis par
+l'environnement. Le forcer produisait un avertissement sur `stderr` à chaque
+appel, sans rien apporter.
 
 ## Reprise
 

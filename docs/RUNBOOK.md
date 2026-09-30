@@ -37,10 +37,61 @@ pas une duplication.
 
 ## Étape 3 — dépendances
 
-**`expdp` absent.** Le `PATH` du compte SSH n'est pas celui du compte
-interactif. Un AIX pose typiquement le chemin Oracle dans `.profile`, que
-`ssh <hote> sh -s` ne lit pas. Le remède nommé par l'outil est de vérifier le
-`PATH` du compte exécuté, pas d'installer le client.
+**`expdp` absent.** Deux causes, et l'ordre compte : vérifier d'abord le `PATH`
+de l'hôte, ensuite le profil.
+
+`Ni Ansible ni ssh n'ouvrent une session de connexion. Or un AIX pose
+typiquement `ORACLE_HOME/bin` dans `/etc/profile` ou `~/.profile`, qu'une
+coquille non interactive ne source pas. L'outil source ces fichiers au début de
+chaque script — mais **seulement s'ils sont exécutables par le shell qui les
+source**, ce que contrôle un `sh -n` préalable. Un `.profile` écrit en bash sur
+un hôte dont `/bin/sh` est dash est donc ignoré, silencieusement.
+
+```sh
+# 1. le client est-il là, pour le compte du run ?
+ansible osd_source -i inventory/hosts --vault-password-file /etc/osd/vault-pass \
+       -m shell -a 'command -v expdp || echo ABSENT'
+
+# 2. le profil est-il exploitable par /bin/sh ?
+ansible osd_source -i inventory/hosts --vault-password-file /etc/osd/vault-pass \
+       -m shell -a 'sh -n ~/.profile && echo PROPRE || echo ILLISIBLE'
+```
+
+`ILLISIBLE` au point 2 alors que le client existe au point 1 : le profil doit
+être réécrit en POSIX sh. Ce n'est pas une Contrainte de l'outil, et c'est le
+seul cas où la réponse est « modifier la configuration de l'hôte ».
+
+## Étape 13 — transfert
+
+**« aucun mécanisme de transfert disponible entre les deux hôtes ».** Les trois
+backends ont été essayés et ont tous échoué ; le rapport en nomme un par un.
+L'authentification est la cause dans la quasi-totalité des cas, et le transfert
+passe **hors Ansible** — c'est ce qui le distingue de toutes les autres étapes.
+
+| Message | Cause |
+|---------|-------|
+| `Permission denied (publickey,...)` | clé absente du `authorized_keys` de l'hôte, ou `ansible_user` ne correspond à aucun compte |
+| `Could not resolve hostname osd_source` | `ansible_host` absent de l'inventaire : le nom d'inventaire n'est résolvable que par Ansible |
+| `no identity file` / `Host key verification failed` | `ansible_ssh_private_key_file` non posé, ou hors `known_hosts` |
+| `Host key verification failed` sur une clé *connue* | clé d'hôte **changée** : c'est le cas qui doit alerter, pas celui qu'on contourne avec `StrictHostKeyChecking=no` |
+
+Le nom d'hôte employé par le transfert vient de `ansible_host`, et non du nom
+d'inventaire. Un inventaire qui sépare le nom de l'adresse — la pratique
+recommandée, puisque le nom survit à un changement d'IP — est le cas normal ;
+c'est le transfert qui doit traduire.
+
+**`rsync` échoue avec `Could not resolve hostname connecttimeout=10`.** Ce
+message ne parle que de résolution de nom, alors que la cause est une ligne de
+commande mal construite : `rsync` découpe la valeur de son `-e` sur les espaces
+et la passe à un shell, donc `-o` doit précéder **chaque** option. Ce défaut a
+été masqué en production par le repli automatique vers `scp`, qui lui succeed :
+le run passait, avec un backend différent de celui demandé.
+
+**Le transfert n'a pas de dialogue possible.** En mode mot de passe, `BatchMode`
+est retiré de l'inventaire et remplacé par `NumberOfPasswordPrompts=1`. Un
+inventaire qui pose `BatchMode=yes` *et* `ansible_password` ne peut donc pas
+s'authentifier : les deux options se contredisent, et l'erreur est une
+authentification refusée, sans mention de leur contradiction.
 
 ## Étape 4 et 5 — connexion
 

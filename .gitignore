@@ -18,6 +18,19 @@ reports/*
 config/config.conf
 config/*.conf.bak
 
+# Ansible Vault. `all.yml.example` est versionne (structure lisible sans
+# dechiffrer) ; le fichier chiffre ne l'est pas : meme chiffre, il
+# constitue une cible et dispense de connaitre la structure.
+inventory/group_vars/all.yml
+inventory/group_vars/*.yml
+
+# Mot de passe du coffre. Il ne doit JAMAIS entrer dans le depot, et pas
+# seulement le fichier chiffre : un coffre dont le secret est versionne
+# avec son contenu n'est plus un coffre.
+*.vault-pass
+vault-pass*
+.vault_pass
+
 __pycache__/
 *.pyc
 .venv/

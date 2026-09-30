@@ -150,6 +150,64 @@ class Raw(str):
     """
 
 
+#: Chargement du profil de connexion, en tete de tout script distant.
+#:
+#: Un client Oracle sur AIX est dans le `PATH` du compte d'exploitation,
+#: pose par `/etc/profile` ou par `~/.profile`. Ce que nous lancons n'est
+#: ni une session interactive ni une session de connexion : Ansible comme
+#: `ssh` ouvrent une coquille **non interactive, non de connexion**, et
+#: aucune ne source ces fichiers. Le `PATH` de l'exploitant n'y est donc
+#: pas, et `expdp` parait absent alors qu'il est installe.
+#:
+#: Le symptome est trompeur : l'etape 3 annonce « client Oracle absent »
+#: sur un hote ou il est present, et le remede -- « verifier le PATH du
+#: compte execute » -- ne donne rien a verifier.
+#:
+#: Le sourcing est donc pose par nous, avant toute chose. Quatre
+#: precautions, chacune parce que son defaut a ete observe :
+#:
+#: * **avant `set -u`** du prelude. Un profil n'ecrit pas toujours des
+#:   variables qu'il initialise lui-meme ; sourced apres `set -u`, cela
+#:   tuerait le script avant meme le prelude, donc avant tout resultat :
+#:   un echec muet, dont il n'y a rien a analyser ni a rapporter.
+#:
+#: * **valide par `sh -n` avant d'etre source**. Une erreur de syntaxe
+#:   n'est pas un echec d'execution : elle tue le shell courant, et
+#:   `|| :` n'y change rien. Le cas reel est un `.profile` ecrit en bash
+#:   (`[[ ... ]]`, tableaux) sur un hote dont `/bin/sh` est dash : ce
+#:   profil est valide pour l'exploitant, et irait casser **tous** nos
+#:   scripts. Sur AIX, ou `sh` est ksh88 et les profils ecrits pour lui,
+#:   le controle ne laisse passer que des fichiers deja corrects — c'est
+#:   bien la seule question a poser : « ce fichier est-il executable par
+#:   le shell qui va le sourcer ? »
+#:
+#: * **sourcé dans ce shell**, et non dans un sous-shell. C'est ce qui
+#:   permet de ne pas se limiter au `PATH` : un `$( . "$p" )` isolerait
+#:   le `PATH` mais perdrait `ORACLE_HOME`, sans lequel `sqlplus` echoue
+#:   en SP2-0750. Le prix de l'erreur de syntaxe est donc un profil
+#:   **ignore**, pas un script perdu.
+#:
+#: * **`PATH` re-exporte**, car un profil l'affecte sans toujours
+#:   l'exporter, et une variable non exportee n'agit sur aucune commande
+#:   qui suit la source.
+#:
+#: Aucun de ces fichiers n'est obligatoire : un hote dont le client est
+#: deja dans le `PATH` herite n'a rien a charger. Le cout est de trois
+#: appels a `sh -n` par script, de l'ordre de la dizaine de millisecondes
+#: sur AIX.
+_PROFIL = """# --- profil de connexion ---
+# Ni Ansible ni ssh n'ouvrent une session de connexion : sans ces
+# fichiers, le PATH du compte d'exploitation -- ou se trouve le client
+# Oracle sur AIX -- n'est pas celui de l'exploitant.
+for _osd_prof in /etc/profile "$HOME/.profile" "$HOME/.profile.ksh"; do
+    [ -r "$_osd_prof" ] || continue
+    sh -n "$_osd_prof" >/dev/null 2>&1 || continue
+    . "$_osd_prof" >/dev/null 2>&1 || :
+done
+unset _osd_prof
+export PATH"""
+
+
 def build_script(
     body: str,
     argv: Sequence[str],
@@ -189,6 +247,8 @@ def build_script(
         raise ValueError("argv vide")
 
     parts: List[str] = []
+    parts.append(_PROFIL)
+    parts.append("")
     if env:
         parts.append("# --- environnement requis par le client Oracle ---")
         for name, value in sorted(env.items()):
