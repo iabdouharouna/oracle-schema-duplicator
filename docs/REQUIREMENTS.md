@@ -207,8 +207,12 @@ Ce qui découle :
 
 Code **modulaire**, **documenté**, **testable**, **robuste**, **exploitable en
 production**, **compatible cron**, **correctement journalisé**. Scripts distants
-**POSIX sh** (ksh93) : zéro bashisme, zéro Python, zéro `eval`, zéro `grep -o`,
-zéro `grep -P`, zéro `sed -i`, zéro `cpio`.
+**POSIX sh**, et le Bourne shell d'AIX avec lui — c'est `/bin/sh` sur la
+plateforme cible, pas ksh93 : zéro bashisme, zéro Python, zéro `eval`, zéro
+`grep -o`, zéro `grep -P`, zéro `sed -i`, zéro `cpio`. Deux particularités de ce
+shell sont traitées explicitement, parce qu'elles ne se devinent pas : `set -u`
+y est inutilisable, et le trap de sortie n'y reçoit pas le code de sortie. Voir
+`docs/REMOTE_PROTOCOL.md`.
 
 ## Tests
 

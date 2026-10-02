@@ -22,10 +22,13 @@
 osd_dir=${1:-}
 osd_prefix=${2:-}
 osd_suffix=${3:-}
-# `${N:-}` et non `$N` : sous le `set -u` du prelude, un argument
-# manquant arreterait le script sur « unbound variable » avant tout
-# controle, avec un code 1 indistinct d'une erreur interne et sans
-# `OSD_FATAL`.
+# `${N:-}` et non `$N` : l'absence d'argument doit se voir par un controle
+# explicite, qui produit un code 64 (« invocation incorrecte ») et un
+# `OSD_FATAL` nommant l'argument. Une lecture nue de `$N` donnerait un
+# code 1, indistinct d'une erreur interne, et sans dire a l'exploitant ce
+# qu'il doit corriger. La forme `${N:-}` reste la bonne quelle que soit
+# la politique du prelude sur `set -u` : c'est elle qui fournit la chaine
+# vide sur laquelle porte ce controle.
 if [ -z "$osd_dir" ]; then
     osd_die "remote_listdir: aucun repertoire fourni" 64
 fi
@@ -113,4 +116,4 @@ unlink)
     ;;
 esac
 
-exit 0
+osd_exit 0

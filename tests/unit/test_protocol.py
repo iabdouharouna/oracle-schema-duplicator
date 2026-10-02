@@ -500,6 +500,77 @@ class TestEspace(CasDeTest):
         self.assertLessEqual(r.get_int("OSD_AVAIL_BYTES", 0),
                              r.get_int("OSD_TOTAL_BYTES", 0))
 
+    def _df_factice(self, nom: str, corps: str) -> Path:
+        """Installe un `df` de remplacement, plus proche dans le `PATH`.
+
+        `PATH` est transmise par `LocalRunner` au processus execute, donc
+        un binaire de meme nom place en tete redefinit le `df` reel. La
+        machine de test etant sous Linux, c'est le seul moyen
+        d'exercer la disposition de colonnes d'AIX.
+        """
+        faux_bin = self.racine / "bin-factice"
+        faux_bin.mkdir(exist_ok=True)
+        chemin = faux_bin / "df"
+        with open(chemin, "w", encoding="ascii") as f:
+            f.write("#!/bin/sh\ncat <<'FIN'\n" + corps + "\nFIN\n")
+        chemin.chmod(0o755)
+        # Le `PATH` herite est conserve apres le faux `df` : `awk`, `tail`,
+        # `dirname` et `wc` doivent rester les vrais.
+        courant = os.environ.get("PATH", "")
+        return mock.patch.dict(
+            os.environ, {"PATH": f"{faux_bin}{os.pathsep}{courant}"})
+
+    def test_la_disposition_de_colonnes_d_aix_est_comprise(self):
+        """AIX n'affiche pas la colonne « Used » : `Free` occupe le champ 3.
+
+        Mesure sur AIX 7.2, la sortie de `df -k` est :
+
+            /dev/lvdata  1779957760 1036628124  42%  45313  1% /pwcdata
+                          total       free    %used  iused %iused  montage
+
+        alors que Linux rend `Used` en 3 et `Available` en 4. Lire le champ
+        4 comme un compte de blocs y donne « 42% », que la validation
+        rejette : l'etape 9 degradait alors en « espace non mesurable »,
+        avec un avertissement invitant a verifier l'espace — alors que la
+        mesure etait parfaitement possible, et que le chiffre existe.
+        """
+        # 1 Go de blocs au total, 400 Mo libres.
+        corps = "\n".join([
+            "Filesystem    1024-blocks      Free %Used    Iused %Iused"
+            " Mounted on",
+            "/dev/lvdata    1048576     409600   61%     12345     1%"
+            " /pwcdata",
+        ])
+        with self._df_factice("df_aix", corps):
+            r = self.executer("remote_space.sh", self.repertoire)
+        self.assertEqual(r.rc, 0, f"{r.kv} {r.stderr}")
+        self.assertEqual(r.get("OSD_DF_LAYOUT"), "aix")
+        # 409600 KiB, et non « 61% ».
+        self.assertEqual(r.get_int("OSD_AVAIL_KB", -1), 409600)
+        self.assertEqual(r.get_int("OSD_TOTAL_KB", -1), 1048576)
+        # `Used` est deduit, faute de colonne : 1048576 - 409600.
+        self.assertEqual(r.get_int("OSD_USED_KB", -1), 1048576 - 409600)
+
+    def test_la_disposition_de_colonnes_de_linux_est_inchangee(self):
+        """Le chemin deja couvert ne doit pas avoir bouge.
+
+        Le test precedent introduit une detection de disposition ; celle-ci
+        verifie que le cas nominal, seul cas reellement rencontre en
+        developpement, produit toujours les memes chiffres qu'avant.
+        """
+        corps = "\n".join([
+            "Filesystem     1024-blocks     Used Available Capacity"
+            " Mounted on",
+            "/dev/sda1       1048576   204800    819776      20% /",
+        ])
+        with self._df_factice("df_posix", corps):
+            r = self.executer("remote_space.sh", self.repertoire)
+        self.assertEqual(r.rc, 0, f"{r.kv} {r.stderr}")
+        self.assertEqual(r.get("OSD_DF_LAYOUT"), "posix")
+        self.assertEqual(r.get_int("OSD_AVAIL_KB", -1), 819776)
+        self.assertEqual(r.get_int("OSD_TOTAL_KB", -1), 1048576)
+        self.assertEqual(r.get_int("OSD_USED_KB", -1), 204800)
+
 
 class TestInfoChemin(CasDeTest):
     def test_un_fichier_present_est_reconnu(self):
@@ -761,6 +832,129 @@ class TestRequetesOracle(CasDeTest):
         oracle = mock.Mock(spec=["query"])
         oracle.query.return_value = []
         self.assertEqual(DataPumpAdapter(None, oracle=oracle).job_status("JOB"), {})
+
+    def test_un_fatal_du_script_remonte_avec_sa_cause(self):
+        """Un `OSD_FATAL` doit nommer sa cause, pas un symptome collateral.
+
+        Un fatal du script d'hote — argument manquant, client absent du
+        `PATH`, fichier temporaire impossible a creer — survient **avant**
+        toute interrogation d'Oracle. Il se retrouve neanmoins dans le meme
+        `Result` qu'un `rc` et des lignes, et l'analyse des colonnes le
+        reduisait alors a « aucune metadonnee retournee » : un message qui
+        designe l'outil et invite a verifier la connexion, alors que la
+        cause etait dans le script et connue.
+
+        Le cas reel est un `osd_tmpfile` refuse par le Bourne shell d'AIX :
+        le script mourait sur `0403-041 Parameter not set`, et l'etape 4
+        annoncait une base injoignable.
+        """
+        from osd.adapters.oracle import OracleAdapter, OracleSide
+        from osd.errors import PrereqError
+
+        fatal = "fichier temporaire impossible"
+
+        class RunnerFatal:
+            kind = "remote"
+            host = "hote-fictif"
+            user = "oracle"
+            probe_dir = "/tmp"
+            label = "ansible:source/hote-fictif"
+
+            def __init__(self) -> None:
+                self.scripts: list = []
+
+            def has_binary(self, name: str) -> bool:
+                return True
+
+            def allows_mutation(self) -> bool:
+                return True
+
+            def run_script(self, script: str, *, timeout=None,
+                           mutating: bool = False):
+                from osd.runner import Result
+
+                self.scripts.append(script)
+                # Le bloc est complet et `rc` vaut 0 : c'est bien ce que
+                # produisait le shell d'AIX, dont le trap ne recevait pas
+                # le code de sortie. Seule la cle `__fatal__` distingueait
+                # l'echec.
+                return Result(
+                    rc=0,
+                    kv={"__fatal__": fatal},
+                    rows=[],
+                    stderr="0403-041 Parameter not set.\n",
+                    stdout_raw=(
+                        "OSD_RESULT_BEGIN\n"
+                        f"OSD_FATAL={fatal}\n"
+                        "OSD_RESULT_END rc=0\n"
+                    ),
+                )
+
+        runner = RunnerFatal()
+        side = OracleSide(
+            name="source", connect="SRC", schema="HR", directory="DP_DIR",
+            wallet="", user="", password="", sysdba=True, runner=runner,
+        )
+        oracle = OracleAdapter(side)
+
+        # Les trois entrees qui brassent le `Result` doivent nommer la
+        # cause : `query` (etape 4), `query_one` et `execute`.
+        for nom, appel in (
+            ("query", lambda: oracle.query("select 1 from dual")),
+            ("query_one", lambda: oracle.query_one("select 1 from dual")),
+            ("execute", lambda: oracle.execute("create table t (a int)")),
+        ):
+            with self.subTest(entree=nom):
+                with self.assertRaises(PrereqError) as ctx:
+                    appel()
+                self.assertIn(fatal, str(ctx.exception))
+                # Le message doit dire que la base n'a pas ete mise en
+                # cause : c'est ce qui oriente l'exploitant vers l'hote.
+                self.assertIn("avant toute connexion", str(ctx.exception.hint or ""))
+
+    def test_une_commande_qui_lit_stdin_aboutit(self):
+        """Une commande qui lit stdin doit **aboutir**, pas bloquer.
+
+        Le contrat de ces corps est que rien n'est fourni sur stdin. Herite
+        via Ansible, stdin n'est ni un terminal ni un fichier clos : toute
+        lecture attend indefiniment, et l'etape ne se termine jamais.
+
+        Le cas reel est l'etape 11 : le client Data Pump accuse reception
+        d'un `userid` « / as sysdba » — la seule forme acceptee sur ces
+        hotes — en affichant `Password:`, consomme une ligne de stdin, et
+        l'export est reste bloque plus de deux heures sur un schema de
+        2 Mo. Le meme export aboutit en 66 s avec `< /dev/null`.
+
+        Le test reproduit la condition, avec `cat` et sans nom de fichier :
+        il lit vraiment stdin, et le test a un delai. Sans la redirection,
+        il expire ; avec elle, la lecture rend la main sur une fin de
+        fichier. Ce qui est verifie est le **retour**, pas le code : le
+        point est que le script est revenu.
+        """
+        r = self.executer("remote_exec.sh", "cat", timeout=30)
+        self.assertIn("OSD_RESULT_END", r.stdout_raw)
+
+    def test_les_clients_oracle_lancent_leur_commande_stdin_ferme(self):
+        """Meme correction pour `expdp`/`impdp` et `sqlplus`.
+
+        Ces deux clients demandent une saisie dans deux situations
+        ordinaires : le mot de passe absent d'un `userid`, et
+        l'invite « Appuyez sur Entree » de fin de script. Ni le parfile ni
+        le script SQL ne passent par stdin — l'un par `parfile=`, l'autre
+        par `@fichier` — donc la fermeture ne peut rien supprimer
+        d'utile.
+
+        Un client Oracle n'etant pas disponible sur la machine de test,
+        l'assertion porte sur la **commande rendue**, seule partie du
+        chemin que ce test peut atteindre.
+        """
+        for nom, args in (
+            ("remote_datapump.sh", ["expdp", "/par/inexistant.par"]),
+            ("remote_sqlplus.sh", ["/@CIBLE", "select 1 from dual"]),
+        ):
+            with self.subTest(script=nom):
+                rendu = build_script(load_body(nom), [str(a) for a in args])
+                self.assertIn('< "/dev/null"', rendu, nom)
 
     def test_un_parfile_absent_est_signale(self):
         r = self.executer("remote_datapump.sh", "expdp", self.racine / "absent.par")

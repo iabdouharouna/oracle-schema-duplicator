@@ -33,7 +33,17 @@ osd_kv OSD_EXEC_PATH "$osd_path"
 osd_out=$(osd_tmpfile out) || osd_die "fichier temporaire impossible" 70
 osd_err=$(osd_tmpfile err) || osd_die "fichier temporaire impossible" 70
 
-"$osd_path" "$@" >"$osd_out" 2>"$osd_err"
+# stdin est ferme sur `/dev/null`, comme dans `remote_datapump.sh` et
+# `remote_sqlplus.sh`.
+#
+# Ce corps lance une commande **arbitraire** dont le contrat ne dit rien
+# de ses entrees. Herite via Ansible, stdin n'est ni un terminal ni un
+# fichier clos : toute commande qui tente de lire — un `cat` sans fichier,
+# un client qui demande un mot de passe, une invite de confirmation —
+# attend indefiniment, et l'etape ne se termine jamais. Sur un hote ou le
+# `PATH` du compte est different, c'est aussi le symptome d'un `PATH`
+# incomplet mal diagnostique.
+"$osd_path" "$@" < "/dev/null" >"$osd_out" 2>"$osd_err"
 osd_rc=$?
 
 osd_kv OSD_RC "$osd_rc"
@@ -56,4 +66,4 @@ if [ -s "$osd_err" ]; then
 fi
 
 rm -f "$osd_out" "$osd_err" 2>/dev/null || true
-exit "$osd_rc"
+osd_exit "$osd_rc"

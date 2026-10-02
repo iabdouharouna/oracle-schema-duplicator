@@ -18,10 +18,12 @@
 # detectees par `whenever sqlerror exit failure` et par recherche de
 # `ORA-xxxxx` dans la sortie brute, jamais par un texte traduit.
 
-# `${N:-}` et non `$N` : sous le `set -u` du prelude, un argument
-# manquant arreterait le script sur « unbound variable » avant tout
-# controle, avec un code 1 indistinct d'une erreur interne et sans
-# `OSD_FATAL`.
+# `${N:-}` et non `$N` : l'absence d'argument doit se voir par un controle
+# explicite, qui produit un code 64 (« invocation incorrecte ») et un
+# `OSD_FATAL` nommant l'argument. Une lecture nue de `$N` donnerait un
+# code 1, indistinct d'une erreur interne. La forme `${N:-}` reste la bonne
+# quelle que soit la politique du prelude sur `set -u` : c'est elle qui
+# fournit la chaine vide sur laquelle porte ce controle.
 osd_connect=${1:-}
 osd_sql=${2:-}
 
@@ -90,7 +92,17 @@ osd_sqlfile=$(osd_tmpfile sql) || osd_die "fichier temporaire impossible" 70
 osd_out=$(osd_tmpfile out) || osd_die "fichier temporaire impossible" 70
 osd_err=$(osd_tmpfile err) || osd_die "fichier temporaire impossible" 70
 
-sqlplus -S -L "$osd_connect" @"$osd_sqlfile" >"$osd_out" 2>"$osd_err"
+# stdin est ferme sur `/dev/null`, comme dans `remote_datapump.sh`.
+#
+# SQL*Plus peut demander une saisie : un mot de passe absent d'une chaine
+# de connexion, ou la confirmation « Appuyez sur Entree » en fin de script
+# si une commande laisse le curseur en attente. Le script passe par
+# `@fichier` et n'a donc **rien** a lire sur stdin. Herite via Ansible, ce
+# descripteur n'est ni un terminal ni un fichier clos : la lecture ne rend
+# jamais la main, et l'etape bloque indefiniment — ce qui est arrive sur
+# l'etape 4, avant que `set -u` ne soit rendu visible.
+sqlplus -S -L "$osd_connect" @"$osd_sqlfile" \
+    < "/dev/null" >"$osd_out" 2>"$osd_err"
 osd_rc=$?
 
 osd_kv OSD_RC "$osd_rc"
@@ -131,4 +143,4 @@ if [ -s "$osd_err" ]; then
 fi
 
 rm -f "$osd_sqlfile" "$osd_out" "$osd_err" "$osd_out.codes" 2>/dev/null || true
-exit "$osd_rc"
+osd_exit "$osd_rc"

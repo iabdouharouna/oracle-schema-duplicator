@@ -51,6 +51,13 @@ _PROBE_PATH_BODY = "remote_pathinfo.sh"
 #: `scp-legacy` est place avant `scp` volontairement : sur un AIX, c'est
 #: la seule voie qui fonctionne quand le `sshd` n'expose pas le
 #: sous-systeme `sftp`, ce qui est le cas le plus courant.
+#:
+#: `sftp` reste liste, et echoue toujours : son nom doit apparaitre dans le
+#: compte rendu des tentatives plutot que disparaitre du vocabulaire. Il ne
+#: peut pas transferer en `relais` -- son script ne connait qu'un hote --
+#: et `_sftp_command` le dit en une phrase au lieu de le laisser echouer
+#: sur un chemin qui n'existe pas. Le retirer de la liste rendrait
+#: `TRANSFER_MODE=sftp` muet, alors qu'un operateur peut l'avoir pose.
 AUTO_ORDER = ("rsync", "scp-legacy", "scp", "sftp")
 
 #: Duree de validite d'une sonde de capacite. Court : un `sshd` peut
@@ -280,8 +287,10 @@ class TransferBackend:
             "aucun mecanisme de transfert disponible entre les deux hotes",
             detail=failures,
             hint="Verifier l'acces SSH par cle entre le serveur de saut et "
-                 "chaque hote. Sur AIX, si le sous-systeme sftp est absent, "
-                 "utiliser TRANSFER_MODE=scp-legacy.",
+                 "chaque hote : `scp` et `rsync` y sont lances et "
+                 "designent les deux hotes. Sur AIX, si le sous-systeme "
+                 "sftp du `sshd` est absent, TRANSFER_MODE=scp-legacy "
+                 "repond au meme besoin.",
         )
 
     def _topologie(self) -> str:
@@ -551,6 +560,12 @@ class TransferBackend:
         L'erreur ne parle que de resolution de nom, alors que la cause
         est une ligne de commande mal construite -- le genre de defaut
         qui envoie vers le DNS alors que le probleme est ici.
+
+        Contrairement a `scp`, `rsync` fait passer un transfert
+        distant-a-distant **par la machine qui l'a lance** : les deux
+        sessions `ssh` sont ouvertes depuis le serveur de saut, qui a
+        deja les deux cles. Aucune option n'est donc necessaire ici, et
+        aucune cle n'a etre distribuee entre les hotes.
         """
         argv = ["rsync", "-a", "--partial", "--timeout=120"]
         # Aucun delai de connexion n'est ajoute ici. L'option qui le
@@ -575,7 +590,7 @@ class TransferBackend:
             argv.extend(["-e", ssh])
         argv.extend([
             f"{_hote(self.source)}:{PurePosixPath(src_dir) / name}",
-            f"{PurePosixPath(dst_dir) / name}",
+            _cible(self.target, dst_dir, name),
         ])
         return argv
 
@@ -584,13 +599,30 @@ class TransferBackend:
     ) -> List[str]:
         """Commande `scp`.
 
+        **`-3` est obligatoire en topologie `relais`.** Sans lui, `scp`
+        fait le second saut **depuis la source** : la source ouvre sa
+        propre session `ssh` vers la cible, avec sa propre cle. Sur ces
+        hotes, ou aucune cle n'est distribuee entre AIX, l'echec est
+        « Permission denied, please try again » — un message
+        d'authentification qui ne dit pas que le chemin est bon et que
+        seule la cle manque. La source et la cible n'ont aucune raison de
+        se faire confiance : elles n'ont meme pas de raison de se connaitre.
+
+        `-3` fait passer les deux sauts par le serveur de saut, qui a
+        deja les deux cles. Le transfert reste donc exactement aussi
+        controle, et ne demande aucune cle distribuee entre les hotes.
+
+        L'option est posee **avant** les `-o`, comme `-O` : `scp` analyze
+        les options par ordre, et une option placee apres une paire
+        d'arguments serait prise pour un chemin.
+
         Le mode heritage (`-O`) impose l'ancien protocole `scp` distant
         au lieu du SFTP de l'OpenSSH 9. C'est le mode a utiliser sur un
         AIX dont le `sshd` ne fournit pas le sous-systeme sftp, ou le
         transfert echoue avec « Subsystem request failed » sans qu'aucun
         journal ne dise pourquoi.
         """
-        argv = ["scp"]
+        argv = ["scp", "-3"]
         if legacy:
             # `-O` n'existe pas avant OpenSSH 9 : sa presence est
             # verifiee plutot que de laisser `scp` echouer sur une
@@ -609,50 +641,38 @@ class TransferBackend:
             argv.extend(["-o", opt])
         argv.extend([
             f"{_hote(self.source)}:{PurePosixPath(src_dir) / name}",
-            f"{PurePosixPath(dst_dir) / name}",
+            _cible(self.target, dst_dir, name),
         ])
         return argv
 
     def _sftp_command(
         self, src_dir: str, dst_dir: str, name: str, ssh_opts: Sequence[str]
     ) -> "tuple[bool, str]":
-        """Transfert par `sftp` en mode batch, via un script sur stdin.
+        """Backend `sftp` : **toujours refuse**, et pour une raison nommee.
 
-        Le mode batch est obligatoire : sans lui, `sftp` ouvre une invite
-        interactive qui bloquerait indefiniment sous cron, sans journal
-        et sans code de sortie.
+        Il est appele par le meme code que `rsync` et `scp`, et rend le
+        meme couple `(ok, raison)` -- d'ou l'absence de toute option dans
+        la signature : il n'y a plus rien a configurer.
+
+        **`sftp` ne sait pas ecrire a distance.** A la difference de `scp`
+        et `rsync`, son script ne connait qu'un seul hote : `get` y
+        telecharge, et le second chemin est un chemin **local au serveur
+        de saut**. Un `relais` -- dont les deux cotes sont distants, par
+        definition -- n'a donc aucune forme en `sftp` : le dump atterrirait
+        sur le serveur de saut, la cible ne le verrait jamais, et l'import
+        echouerait trois etapes plus loin sur un fichier absent.
+
+        Le refus est donc explicite, et anterieur a tout lancement de
+        processus : laisser `sftp` echouer produirait un message de fichier
+        introuvable, qui envoie l'exploitant verifier des droits alors que
+        le chemin est faux par construction, et deposerait reellement le
+        fichier sur le serveur de saut avant d'echouer.
         """
-        batch = (
-            f"get {PurePosixPath(src_dir) / name} "
-            f"{PurePosixPath(dst_dir) / name}\nquit\n"
+        return False, (
+            "sftp ne peut pas ecrire sur un hote distant ; "
+            f"le serveur de saut deposerait le dump dans {dst_dir}, "
+            "que la cible ne voit pas"
         )
-        # `BatchMode` vient de `_merge_opts`, qui l'a deja pose selon le
-        # mode d'authentification. Le poser en dur ici, puis sauter tout
-        # ce qui porte ce nom, rendait cette decision intouchable : en
-        # mode mot de passe, le `BatchMode=yes` initial interdisait
-        # l'authentification et le transfert echouait toujours.
-        argv = ["sftp", "-b", "-"]
-        for opt in _merge_opts(ssh_opts, self.ssh_password):
-            argv.extend(["-o", opt])
-        argv.append(_hote(self.source))
-        argv = _prefixe_sshpass(self.ssh_password) + argv
-        try:
-            proc = _run_command(
-                argv,
-                input=batch.encode("utf-8"),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=_PROBE_TIMEOUT,
-                check=False,
-                env=_env_avec_mot_de_passe(self.ssh_password),
-            )
-        except FileNotFoundError:
-            return False, "client sftp absent du serveur de saut"
-        except subprocess.TimeoutExpired:
-            return False, "delai de connexion sftp depasse"
-        if proc.returncode != 0:
-            return False, _classify_error(proc.stderr)
-        return True, ""
 
     # -- Transfert reel ---------------------------------------------------
     def run(
@@ -761,6 +781,36 @@ def _probe_content_arg() -> str:
 
 def _sq(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _cible(runner, dst_dir: str, name: str) -> str:
+    """`utilisateur@hote:/chemin` — la destination **distante** du fichier.
+
+    La source est designee par `_hote(source)`, et rien d'autre ne pouvait
+    designer la cible. La commande produite par defaut etait donc :
+
+        scp oracle@src:/pwcdata/export/f.dmp /pwcdata/import/f.dmp
+
+    ou le second chemin est un chemin **local au serveur de saut**. Sur une
+    topologie `relais` — les deux cotes distants, ce qui est la seule
+    topologie de transfert — ce repertoire n'existe generalement pas sur le
+    serveur de saut. Le client echouait alors sur un message de fichier
+    introuvable ou de droit refuse, qui ne parle que de la destination et
+    envoie l'exploitant verifier des permissions sur le mauvais hote. La
+    cause reelle — un chemin construit pour une machine qui n'est pas celle
+    qui recoit le fichier — ne se lisait nulle part.
+
+    La cible est donc designee comme la source l'est, et par la meme
+    fonction : le compte et l'adresse viennent de l'inventaire, ce qui
+    garantit qu'Ansible et `scp` designent le meme hote. Les deux ne
+    peuvent plus diverger, donc le dump ne peut plus atterrir ailleurs que
+    la ou l'import le cherchera.
+
+    `scp` et `rsync` savent tous deux relier deux hotes distants. `sftp` ne
+    le sait pas, et `_sftp_command` refuse ce cas plutot que de le laisser
+    echouer.
+    """
+    return f"{_hote(runner)}:{PurePosixPath(dst_dir) / name}"
 
 
 def _hote(runner) -> str:

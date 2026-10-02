@@ -14,6 +14,22 @@
 #   * pas de `stat -c` (GNU), pas de `du -sb` (GNU).
 #   * awk POSIX uniquement, avec intervalles `\t` toleres.
 #
+# COLONNES : les deux systemes n'affichent pas la meme chose.
+#
+#   Linux (df -k) : Filesystem 1024-blocks Used Available Use% Mounted on
+#   AIX   (df -k) : Filesystem 1024-blocks Free   %Used    Iused %Iused Mounted on
+#
+# AIX n'affiche PAS la colonne « Used » : le champ 3 y est deja la place
+# libre, et le champ 4 est un pourcentage. Lire les champs a position fixe
+# comme sur Linux prend donc « 42% » pour un nombre d'un unites de 1024
+# octets — la place libre. La validation echoue alors, et l'etape 9 degrade
+# proprement en « espace non mesurable », sans jamais donner de chiffre faux
+# mais aussi sans jamais donner de chiffre du tout.
+#
+# On reconnait donc la disposition sur le caractere du champ 4 : un
+# pourcentage ne peut pas etre un compte de blocs. La lecture par position
+# reste exacte sur les deux systemes, sans `df -P` ni option proprietaire.
+#
 # Usage :
 #   remote_space <chemin_absolu>
 
@@ -47,10 +63,8 @@ osd_kv OSD_PATH "$osd_path"
 osd_kv OSD_EXISTS 1
 osd_kv OSD_FILESYSTEM "$osd_target"
 
-# Sortie de df -k : 6 colonnes POSIX (Filesystem, 1024-blocks, Used,
-# Available, Capacity, Mounted on). Certaines variantes AIX placent le
-# point de montage avant le nom de peripherie, d'ou la selection par
-# position et non par nom.
+# Sortie de df -k. Certaines variantes placent le point de montage avant
+# le nom de peripherie, d'ou la selection par position et non par nom.
 osd_df=$(df -k "$osd_target" 2>/dev/null | tail -n 1)
 if [ -z "$osd_df" ]; then
     osd_die "df n'a pas pu analyser $osd_target" 69
@@ -59,8 +73,24 @@ fi
 osd_kv OSD_DF_RAW "$osd_df"
 
 osd_total_kb=$(printf '%s\n' "$osd_df" | awk '{ print $2 }')
-osd_used_kb=$(printf '%s\n' "$osd_df" | awk '{ print $3 }')
-osd_avail_kb=$(printf '%s\n' "$osd_df" | awk '{ print $4 }')
+# Champ 4 : sur Linux c'est Available, sur AIX c'est le pourcentage
+# d'occupation. Un pourcentage se reconnait a son '%', et ne peut pas
+# etre un compte de blocs.
+osd_champ4=$(printf '%s\n' "$osd_df" | awk '{ print $4 }')
+case "$osd_champ4" in
+    *%*)
+        # AIX : Free est en 3, et il n'y a pas de colonne « Used ».
+        osd_avail_kb=$(printf '%s\n' "$osd_df" | awk '{ print $3 }')
+        osd_used_kb=$(( osd_total_kb - osd_avail_kb ))
+        osd_kv OSD_DF_LAYOUT aix
+        ;;
+    *)
+        # Linux : Used en 3, Available en 4.
+        osd_used_kb=$(printf '%s\n' "$osd_df" | awk '{ print $3 }')
+        osd_avail_kb="$osd_champ4"
+        osd_kv OSD_DF_LAYOUT posix
+        ;;
+esac
 
 # Validation sans `eval` (interdit par AGENTS.md) : une valeur de `df`
 # inexploitable doit degrader l'etape 9 en erreur explicite plutot que
@@ -92,4 +122,4 @@ if [ "$osd_total_kb" -gt 0 ] 2>/dev/null; then
     osd_kv OSD_USED_PERCENT "$osd_pct"
 fi
 
-exit 0
+osd_exit 0

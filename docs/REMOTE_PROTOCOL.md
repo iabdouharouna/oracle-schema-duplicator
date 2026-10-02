@@ -124,9 +124,11 @@ défaut.
 
 Quatre points, chacun parce que son défaut a été observé :
 
-- **avant `set -u`** — un profil ne déclare pas toujours les variables
-  qu'il initialise ; sourcé après, le script meurt avant le prelude, donc
-  avant tout résultat : un échec muet, sans bloc à analyser ni à rapporter.
+- **avant le prelude, et protégé** — un profil ne déclare pas toujours les
+  variables qu'il initialise, et peut employer une construction propre à sa
+  coquille de connexion. Sourcé après `set -u`, il tuerait le script avant le
+  prelude, donc avant tout résultat : un échec muet. Le `|| :` et le
+  `sh -n` le rendent inerte.
 - **validé par `sh -n`** — une erreur de syntaxe n'est pas un échec
   d'exécution, elle tue le shell courant et `|| :` n'y change rien. Le cas
   réel est un `.profile` écrit en bash sur un hôte dont `/bin/sh` est dash :
@@ -158,7 +160,7 @@ réellement observées :
 - **`bootstrap` avant les arguments** — un `Raw` ne peut désigner qu'une
   variable **déjà posée**. C'est ainsi que le parfile est écrit par
   l'amorçage puis désigné par `Raw('"$osd_parpath"')`. Inversé, le script
-  évalue `osd_parpath: unbound variable` sous `set -u` et meurt avant l'export.
+  évalue `osd_parpath` sur une variable jamais posée et meurt avant l'export.
 
 `bootstrap` ne peut donc pas référencer `osd_argN`, et aucun appelant n'en a
 besoin.
@@ -169,7 +171,10 @@ définies ; tout le reste est mis entre guillemets simples.
 
 ## Contraintes du shell
 
-Sur AIX, `/bin/sh` est **ksh93**. Sont donc interdits, et leur absence est
+Sur AIX 7.2, `/bin/sh` est le **Bourne shell** — mesuré sur les deux hôtes
+de l bank's d'essai : `/bin/sh` et `/usr/bin/sh` y sont le même binaire, et
+`KSH_VERSION` n'y est pas défini. Le ksh93 est `/usr/bin/ksh`, que le
+protocole n'utilise pas. Sont donc interdits, et leur absence est
 vérifiée :
 
 | Interdit | Raison |
@@ -178,6 +183,44 @@ vérifiée :
 | `echo -e`, `printf %q` | comportement non portable |
 | substitution de processus, `read -d` | non POSIX |
 | `grep -o`, `grep -P` | absents ou divergents sur AIX |
+
+Deux particularités de ce Bourne shell ne se devinent pas à la lecture du
+code, et se paient cher si on les suppose ksh93. Elles ont été mesurées sur
+l'hôte, pas déduites.
+
+### `set -u` est inutilisable
+
+Sous `set -u`, ce shell lève une erreur `0403-041 Parameter not set.` sur
+**toute** expansion d'un paramètre non défini — y compris sous la forme
+`${V:=défaut}` qui devrait justement le définir, et y compris la forme
+`${V-défaut}`. Il n'existe donc **aucune** forme d'expansion qui survive à
+`set -u` dans ce shell ; les deux contournements habituels ont été essayés
+avant d'abandonner.
+
+Le premier `${N:-}` du corps suffisait à tuer le script, avant tout travail
+utile, avec un `0403-041` sur stderr et **sans aucun bloc de résultat**. C'est
+le défaut qui a fait échouer l'étape 4 sur les AIX du bank's d'essai.
+
+Le prelude pose donc `set +u` partout, sans exception — voir
+[Le mode strict](#le-mode-strict). C'est un choix délibéré : un mode strict
+actif sur certains shells et inactif sur d'autres crée une famille de bogues
+qui n'apparaît que sur la plateforme de production.
+
+### Le trap de sortie ne reçoit pas le code de sortie
+
+Dans ce Bourne shell, `$?` n'est pas mis à jour pour le trap de sortie : le
+trap y trouve le statut de la **dernière commande exécutée avant le `exit`**.
+Un `exit 70` y est donc annoncé `rc=0`, exactement comme une sortie normale.
+
+Conséquence mesurée : le protocole entier repose sur `OSD_RESULT_END rc=`,
+et cet anneau annonçait 0 pour tout échec. L'analyseur ne pouvait plus
+distinguer une réussite d'un échec, et le rapport pouvait conclure à un
+succès sur un export qui avait échoué.
+
+Le code est donc transporté **explicitement** par `osd_exit`, qui le mémorise
+avant de quitter ; le trap le restitue à `osd_finish`. Sur ksh93, `$?`
+donnerait le même résultat, mais une forme unique pour tous les shells évite
+d'avoir à savoir lequel est en service.
 | `sed -i` | non POSIX |
 | `cpio` | absent du `PATH` minimal |
 | **tout `eval`** | règle absolue du projet |
@@ -232,13 +275,36 @@ Oracle sont traduits, on ne les analyse donc pas — on en extrait des codes.
 
 ## Le trap
 
-`trap 'osd_finish $?' 0` est enregistré **avant tout travail utile**. Même un
-`set -u` qui échoue sur une variable non définie produit un bloc de résultat
-exploitable, avec `rc != 0`. Sans cela l'appelant verrait un « bloc de résultat
-distant incomplet » — un message qui n'apprend rien.
+`trap 'osd_finish $_osd_exit_code' 0` est enregistré **avant tout travail
+utile**. Même une mort imprévue du script produit un bloc de résultat
+exploitable. Sans cela l'appelant verrait un « bloc de résultat distant
+incomplet » — un message qui n'apprend rien.
 
-`$?` est développé **avant** l'appel, donc il vaut le code qui déclenche le trap
-et non celui du `rm` de nettoyage.
+Le trap ne lit pas `$?` : il restitue le code que `osd_exit` a mémorisé. Ce n'est
+pas une précaution de style, c'est la seule forme qui donne le vrai code sur
+le Bourne shell d'AIX, dont le trap reçoit le statut de la dernière commande
+exécutée et non celui du `exit` — voir
+[Le trap de sortie ne reçoit pas le code de sortie](#le-trap-de-sortie-ne-re%C3%A7oit-pas-le-code-de-sortie).
+
+Une sortie normale laisse `_osd_exit_code` à 0, ce qui est le code voulu. Toute
+sortie non normale passe par `osd_exit`, y compris `osd_die` : c'est
+`osd_exit "${2:-1}"`, pas un `exit` nu, qui garantit le code.
+
+### Le mode strict
+
+`set -u` serait utile : il transforme la lecture d'un paramètre jamais défini
+en erreur franche, là où une chaîne vide laisserait passer une valeur absente
+dans une commande ou dans un rapport. Il est **inutilisable** sur AIX, pour la
+raison mesurée donnée plus haut ; le prelude pose donc `set +u` partout.
+
+Le contrôle que `set -u` aurait fourni est remplacé par des contrôles
+explicites : `osd_die` dès qu'un argument obligatoire est vide, ce qui produit
+un code 64 et un `OSD_FATAL` nommant l'argument. Ces contrôles sont exercés par
+des tests qui exécutent réellement le script.
+
+`set -e` reste délibérément absent : le corps repose sur des échecs tolérés
+(`|| true`, `osd_codes`, tests de présence), et un `-e` les transformerait en
+arrêt silencieux du script.
 
 ## Le saut de ligne de tête
 
@@ -270,10 +336,15 @@ saut de ligne ici tomberait **dans** les données.
 | 66 | répertoire ou fichier absent |
 | 127 | binaire introuvable |
 
-Le 64 est distinct de 1 : sous `set -u`, un argument manquant arrêterait le
-script sur « unbound variable » avec un code 1, indistinct d'une erreur interne
-du shell et sans `OSD_FATAL`. L'appelant ne pourrait ni distinguer les deux, ni
-dire à l'exploitant quoi corriger.
+Le 64 est distinct de 1 : un argument manquant doit être détecté par un contrôle
+explicite, qui produit un `OSD_FATAL` nommant l'argument. Une lecture nue de
+`$N` laisserait passer une chaîne vide et ferait échouer l'outil sans dire à
+l'exploitant quoi corriger.
+
+C'est pourquoi le corps lit ses arguments en `${N:-}` : cette forme fournit la
+chaîne vide sur laquelle porte le contrôle. Elle reste la bonne forme quelle
+que soit la politique du prelude sur `set -u` — le mode strict n'est pas la
+raison de ce choix, la lisibilité du contrôle l'est.
 
 ## Nettoyage et secrets
 

@@ -175,6 +175,29 @@ class OracleAdapter:
         return self.side.runner.run_script(script, timeout=timeout)
 
     def _raise_on_oracle_error(self, result: Result, what: str) -> None:
+        # Un `OSD_FATAL` est un echec du **script d'hote**, anterieur a
+        # toute interrogation d'Oracle : un argument manquant, un client
+        # absent du `PATH`, un fichier temporaire impossible a creer. Il se
+        # distingue d'une erreur Oracle, et son message dit ce qu'il faut
+        # corriger — ce que le decoupage des colonnes ne saura jamais dire.
+        # Sans ce test, un fatal remontait en « aucune metadonnee
+        # retournee » : un symptome, designant l'outil la ou la cause est
+        # ailleurs. Le cas reel est un `osd_tmpfile` refuse par le shell
+        # d'AIX, qui s'annoncait ainsi.
+        fatal = result.kv.get("__fatal__", "").strip()
+        if fatal:
+            LOG.error("echec du script distant sur %s: %s",
+                      self.side.label(), redact(fatal))
+            raise PrereqError(
+                f"echec du script distant sur {self.side.label()} "
+                f"({what}) : {fatal}",
+                detail=[redact(line) for line in result.stderr.splitlines()
+                        if line.strip()][:10],
+                hint="Verifier le script distant et l'environnement du "
+                     "compte d'exploitation sur l'hote ; ce defaut "
+                     "intervient avant toute connexion a la base.",
+            )
+
         codes = oracle_error_codes(result)
         rc = result.get_int("OSD_RC", result.rc)
         if not codes and rc == 0:

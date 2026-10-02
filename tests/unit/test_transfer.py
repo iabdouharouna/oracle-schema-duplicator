@@ -31,6 +31,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import support  # noqa: F401
@@ -186,10 +187,9 @@ def _copie_simulee(
             )
         # Les deux dernieres valeurs positionnelles sont la source et la
         # cible. Les isoler par position plutot que par « contient un
-        # `:` » : la destination est un chemin **local**, sans `:` — un
-        # filtre sur le separateur ne la verrait jamais, et la copie
-        # echouerait sur un `IndexError` au lieu de ce qu'on veut
-        # verifier.
+        # `:` » : les options `-o ConnectTimeout=10` ne commencent pas par
+        # `-` une fois le decoupe fait, donc un filtre sur le separateur
+        # selectionnerait des options comme si elles etaient des chemins.
         operandes = [a for a in cmd if not a.startswith("-")]
         if len(operandes) < 2:
             return subprocess.CompletedProcess(cmd, 0, b"", b"")
@@ -206,17 +206,16 @@ def _copie_simulee(
             )
         if silencieux:
             return subprocess.CompletedProcess(cmd, 0, b"copie silencieuse", b"")
-        # Le depot va sur l'hote dont le `probe_dir` correspond a la
-        # destination. Aiguiller sur un `cible` unique ne fonctionnerait
-        # pas pour une comparaison de deux paires d'hotes : les deux
-        # depots partiraient sur le meme, et la verification de la
-        # premiere paire echouerait — pour une raison sans rapport avec ce
-        # que le test cherche a mesurer.
-        # Un hote unique ne laisse pas d'ambiguite : c'est lui, quel que
-        # soit le repertoire. Plusieurs hotes exigent un aiguillage par
-        # `probe_dir` — sans quoi les deux depots partiraient sur le
-        # meme, et la verification de la premiere paire echouerait pour
-        # une raison sans rapport avec ce que le test mesure.
+        # La destination porte un nom d'hote : `tgt.exemple:/dst/f.dmp`.
+        # Il faut donc l'**isoler** avant d'extraire le chemin, sinon la
+        # cle du registre serait `/tgt.exemple/dst/f.dmp` et aucun aiguillage
+        # ne serait plus possible. Le depot doit finir sur l'hote nomme,
+        # pas sur « celui qui correspond au chemin » — un chemin
+        # `/pwcdata/backup/export` identique des deux cotes designait le
+        # mauvais hote, et la verification echouait pour une raison sans
+        # rapport avec ce que le test mesure.
+        _hote_cible, _, chemin_relatif = chemin_cible.rpartition(":")
+        chemin_cible = chemin_relatif or chemin_cible
         if len(cibles) > 1:
             correspondants = [
                 c for c in cibles
@@ -814,7 +813,118 @@ class TestLignesDeCommande(unittest.TestCase):
         """
         argv = self.be._scp_command("/src", "/dst", "f.dmp", [], legacy=False)
         self.assertEqual(argv[-2], "oracle@src.exemple:/src/f.dmp")
-        self.assertEqual(argv[-1], "/dst/f.dmp")
+        self.assertEqual(argv[-1], "admin@tgt.exemple:/dst/f.dmp")
+
+    def test_la_cible_est_aussi_un_hote_distant(self):
+        """Les **deux** cotes sont distants, et doivent l'etre tous les deux.
+
+        La source portait `utilisateur@hote:` ; la cible etait un chemin
+        nu. En topologie `relais` — les deux cotes distants, la seule
+        topologie de transfert — ce chemin est local au serveur de saut,
+        ou n'existe generalement pas. Le client echouait alors sur un
+        message de fichier introuvable ou de droit refuse, qui ne parle
+        que de la destination : l'exploitant verifiait des permissions
+        sur le mauvais hote, et la cause — un chemin construit pour une
+        machine qui ne recoit pas le fichier — ne se lisait nulle part.
+
+        Le test fixe la forme des deux operandes, parce que c'est elle que
+        `scp` interprets comme « ou aller chercher, ou deposer ».
+        """
+        argv = self.be._scp_command("/src", "/dst", "f.dmp", [], legacy=False)
+        self.assertIn("@", argv[-1], f"cible non designee comme hote : {argv[-1]}")
+        self.assertIn(":", argv[-1])
+
+        argv = self.be._rsync_command("/src", "/dst", "f.dmp", [])
+        self.assertEqual(argv[-2], "oracle@src.exemple:/src/f.dmp")
+        self.assertEqual(argv[-1], "admin@tgt.exemple:/dst/f.dmp")
+
+    def test_les_deux_cotes_designent_le_meme_hote_que_le_reste_du_run(self):
+        """Le compte et l'adresse viennent de l'inventaire, comme pour Ansible.
+
+        `_hote` lit `transfer_host`/`transfer_user`, que le runner tire de
+        `ansible_host`/`ansible_user`. La cible passe donc par la meme
+        fonction que la source : si Ansible parle `172.16.1.82` sous le
+        compte `oracle`, `scp` y parle aussi. Deux designations
+        divergentes deposeraient le dump la ou l'import ne le cherche pas.
+        """
+        source = RunnerFaux(label="source", host="inventaire", user="")
+        source.transfer_host = "172.16.1.84"
+        source.transfer_user = "oracle"
+        cible = RunnerFaux(label="cible", host="inventaire", user="")
+        cible.transfer_host = "172.16.1.82"
+        cible.transfer_user = "oracle"
+        be = backend(source=source, target=cible)
+        argv = be._scp_command("/exp", "/imp", "f.dmp", [], legacy=False)
+        self.assertEqual(argv[-2], "oracle@172.16.1.84:/exp/f.dmp")
+        self.assertEqual(argv[-1], "oracle@172.16.1.82:/imp/f.dmp")
+
+    def test_scp_force_les_deux_sauts_par_le_serveur_de_saut(self):
+        """`-3` : le second saut part du serveur de saut, pas de la source.
+
+        Sans `-3`, `scp` distant-a-distant fait ouvrir la seconde session
+        `ssh` **par la source**, avec la cle de la source. Sur deux hotes
+        qui n'ont aucune cle l'une de l'autre — la situation normale —
+        l'echec est « Permission denied, please try again » : un message
+        d'authentification qui ne dit pas que le chemin est bon et que
+        seule la cle manque. Il envoie vers les mots de passe, alors que
+        poser une cle entre les hotes serait une ouverture inutile.
+
+        Avec `-3`, les deux sessions sont ouvertes depuis le serveur de
+        saut, qui possede deja les deux cles. Le transfert est donc aussi
+        controle, sans distribuer de cle entre les hotes.
+        """
+        argv = self.be._scp_command("/src", "/dst", "f.dmp", [], legacy=False)
+        self.assertIn("-3", argv, argv)
+        # L'option doit preceder les `-o` : `scp` analyse dans l'ordre, et
+        # apres une paire d'arguments elle prendrait le chemin pour une
+        # option.
+        self.assertLess(argv.index("-3"), argv.index("-o"))
+
+    def test_rsync_ne_necessite_pas_cette_option(self):
+        """`rsync` fait deja passer le transfert par la machine qui lance.
+
+        L'option serait sans effet, et la poser par reflexe pour
+        « uniformiser » les deux commandes donnerait une ligne qui ne
+        signifie rien. Le test fixe l'absence, pas seulement la presence
+        chez `scp` : une correction ulterieure ne doit pas propager `-3`
+        a une commande qui ne le comprend pas.
+        """
+        argv = self.be._rsync_command("/src", "/dst", "f.dmp", [])
+        self.assertNotIn("-3", argv, argv)
+
+    def test_sftp_est_refuse_en_relais_avec_sa_raison(self):
+        """`sftp` ne peut pas deposer sur un hote distant.
+
+        Son script ne connait qu'un seul hote : `get` y telecharge, et le
+        second chemin est local au serveur de saut. Un `relais` n'a donc
+        aucune forme en `sftp` -- le dump atterrirait sur le serveur de
+        saut, la cible ne le verrait jamais, et l'import echouerait trois
+        etapes plus loin sur un fichier absent.
+
+        Le refus doit nommer la limite du client. Un echec de `sftp`
+       rapperait « fichier absent » et enverrait vers les droits, alors
+        que le chemin est faux par construction.
+        """
+        ok, raison = self.be._sftp_command("/src", "/dst", "f.dmp", [])
+        self.assertFalse(ok)
+        self.assertIn("sftp", raison)
+        self.assertIn("distant", raison)
+        # Le repertoire fautif est nomme : c'est lui que l'exploitant
+        # doit pouvoir reconnaitre dans le rapport.
+        self.assertIn("/dst", raison)
+
+    def test_sftp_ne_declenche_aucun_processus(self):
+        """Le refus doit etre anterieur a toute execution.
+
+        Un `sftp` reellement lance deposerait le fichier sur le serveur de
+        saut avant d'echouer sur une destination inexistante : le run
+        laisserait un artefact derriere lui, et la sonde aurait reellement
+        deplace quelque chose alors qu'elle est censee ne rien transferer.
+        """
+        with mock.patch.object(tr, "_run_command") as lanceur:
+            ok, _ = self.be._sftp_command("/src", "/dst", "f.dmp", [])
+        self.assertFalse(ok)
+        lanceur.assert_not_called()
 
     def test_sans_utilisateur_le_nom_d_hote_suffit(self):
         """Une version emettait `@hote`, une autre non.

@@ -44,6 +44,29 @@ DATAPUMP_SUCCESS_CODES = frozenset({0, 1, 2, 4, 8})
 #: Codes qui signifient « le job a bien tourne, mais il y a un probleme ».
 DATAPUMP_WARNING_CODES = frozenset({2, 4, 8})
 
+#: Codes Oracle que Data Pump ecrit dans sa sortie sans que le dump soit
+#: incomplet. Ils ne doivent pas etre comptes parmi les erreurs.
+#:
+#: La liste est **volontairement courte**. Un code y entre parce qu'il a
+#: ete observe sur un job dont l'etat `DBA_DATAPUMP_JOBS.STATE` valait
+#: `COMPLETED` et dont le dump s'est relu integralement, pas parce qu'il
+#: « resemble a un avertissement ». Elargir cette liste par deduction
+#: reviendrait a declarer complet un dump qui ne l'est pas — exactement le
+#: faux positif que `_assert_datapump` existe pour empecher.
+#:
+#: `ORA-39173` : « Encrypted data has been stored unencrypted in dump file
+#: set. » Le client signale qu'une colonne chiffree est ecrite en clair
+#: dans le fichier de dump. C'est une remarque de **confidentialite** du
+#: fichier produit, pas un defaut d'integrite : le dump est complet, et le
+#: job s'est termine normalement. Mesure sur une 19c, schema `HR`
+#: exportee avec succes puis relue sans reserve.
+#:
+#: Le fait reste signale — en avertissement, avec son code, dans le
+#: rapport. Le masque sur lequel repose le dump est un choix de
+#: l'exploitant : l'outil n'a pas a le corriger, mais il ne doit pas
+#: l'effacer non plus.
+DATAPUMP_BENIGN_CODES = frozenset({"ORA-39173"})
+
 #: Etats de `DBA_DATAPUMP_JOBS.STATE` qui signifient « le travail est
 #: fini ». Volontairement unique : tous les autres etats — `RUNNING`,
 #: `EXECUTING`, `STOPPING`, `FAILED`, `NEEDS_COMMIT` — signifient que le
@@ -403,11 +426,18 @@ class DataPumpAdapter:
         evite les faux positifs et les faux negatifs.
         """
         rc = result.get_int("OSD_RC", result.rc)
-        codes = sorted(set(
+        vus = sorted(set(
             re.findall(r"(?:ORA|UDI|DBMGSPC)-\d+", result.get("OSD_ERROR_CODES", ""))
         ))
-        if not codes:
-            codes = sorted(set(_ERROR_RE.findall(result.stderr)))
+        if not vus:
+            vus = sorted(set(_ERROR_RE.findall(result.stderr)))
+
+        # Un code benigne est retire des erreurs, mais **conserve et
+        # signale** : le rapport doit dire que le dump contient des
+        # donnees en clair, sans pour autant faire echouer une exportation
+        # reussie.
+        codes = [c for c in vus if c not in DATAPUMP_BENIGN_CODES]
+        benins = [c for c in vus if c in DATAPUMP_BENIGN_CODES]
 
         dp_error = result.get("OSD_DATAPUMP_ERROR") == "1"
         out = DataPumpResult(rc=rc, job_name=job_name, error_codes=codes)
@@ -429,6 +459,13 @@ class DataPumpAdapter:
             out.warnings.append(f"Data Pump a signale des avertissements (rc={rc})")
         if dp_error and codes:
             out.warnings.append("codes d'erreur dans la sortie: " + ", ".join(codes))
+        if benins:
+            out.warnings.append(
+                "avertissements sans effet sur l'integrite du dump : "
+                + ", ".join(benins)
+                + " (donnees chiffrees ecrites en clair dans le fichier ; "
+                  "le contenu reste confidentiel)"
+            )
 
         return out
 

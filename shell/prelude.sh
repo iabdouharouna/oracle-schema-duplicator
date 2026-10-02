@@ -7,9 +7,17 @@
 #     ssh -o BatchMode=yes <hote> sh -s
 #
 # Contraintes strictes, non negociables :
-#   * POSIX sh uniquement. Sur AIX, /bin/sh est ksh93 : pas de [[ ]],
-#     pas de tableaux, pas de `local`, pas de `echo -e`, pas de
-#     `printf %q`, pas de substitution de processus, pas de `read -d`.
+#   * POSIX sh uniquement, et **Bourne shell d'AIX compris**. Sur AIX 7.2,
+#     `/bin/sh` est le Bourne shell (`KSH_VERSION` n'y est pas defini) :
+#     ni `[[ ]]`, ni tableaux, ni `local`, ni `echo -e`, ni `printf %q`,
+#     ni substitution de processus, ni `read -d`.
+#   * Deux peculiarities de ce Bourne shell sont traitees plus bas, et
+#     aucune ne se devine a la lecture du code : `set -u` y rend ILLICITE
+#     toute expansion d'un parametre non defini, et le trap de sortie n'y
+#     recoit pas le code de sortie (voir `set +u` et `osd_exit`). Les
+#     traiter comme si le shell etait ksh93 a produit des scripts qui
+#     mouraient a la premiere ligne, avec un code 0 et aucun diagnostic
+#     exploitable — le pire des deux mondes.
 #   * Aucun Python : les hotes AIX n'en ont pas.
 #   * Aucun `eval`, quelle que soit la forme des arguments.
 #   * Aucun `grep -o`, `grep -P`, `sed -i`, `local` : absents ou
@@ -30,10 +38,38 @@
 # insensible a la locale de l'hote (les messages Oracle sont traduits).
 #
 # Le trap sur le pseudo-descripteur 0 est enregistre avant tout travail
-# utile : m^eme un `set -u` qui echoue sur une variable non definie
-# produit un bloc de resultat exploitable, avec rc != 0.
+# utile : meme si le script meurt, il produit un bloc de resultat
+# exploitable.
 
-set -u
+# --- mode strict ----------------------------------------------------------
+# `set -u` est desirable : il transforme la lecture d'un parametre jamais
+# defini en erreur franche, la ou une chaine vide laisserait passer une
+# valeur absente dans une commande ou dans un rapport.
+#
+# Il est cependant **inutilisable** dans le Bourne shell d'AIX, que
+# `/bin/sh` designe aussi (`/bin/sh` et `/usr/bin/sh` y sont le meme
+# binaire, et `KSH_VERSION` n'y est pas defini). Dans ce shell, `set -u`
+# rend ILLICITE toute expansion d'un parametre non defini, y compris sous
+# la forme `${V:=defaut}` qui devrait justement le definir. Le premier
+# `${N:-}` du corps arretait alors tout le script avec
+#
+#     0403-041 Parameter not set.
+#
+# Deux contournements ont ete mesures sur l'hote avant d'abandonner
+# `set -u` : remplacer `${V:-d}` par `${V:=d}` echoue aussi, et il n'existe
+# donc AUCUNE forme d'expansion qui survive a `set -u` dans ce shell.
+#
+# On pose donc `set +u` partout, sans exception. C'est un choix, pas une
+# adaptation opportuniste : un mode strict actif sur certains shells et
+# inactif sur d'autres creerait une famille de bogues qui n'apparait que sur
+# la plateforme de production. Le strict est remplace par des controles
+# explicites — `osd_die` des que la valeur d'un argument est vide — dont
+# l'effet est deja verifie par les tests unitaires.
+set +u
+
+# `set -e` reste deliberement absent : le corps repose sur des echecs
+# toleres (`|| true`, `osd_codes`, tests de presence), et un `-e` les
+# transformerait en arret silencieux du script.
 
 # stdout reel conserve sur le descripteur 3, puis stdout redirige vers
 # stderr : le corps du script peut ecrire librement, sans polluer le
@@ -41,10 +77,12 @@ set -u
 exec 3>&1
 exec 1>&2
 
-#: Fichiers a supprimer en sortie, un par ligne. Volontairement vide au
-#: depart : `set -u` impose de l'initialiser, sinon la premiere lecture
-#: dans `osd_cleanup` echouerait sur un script qui n'a cree aucun
-#: fichier temporaire.
+#: Fichiers a supprimer en sortie, un par ligne.
+#:
+#: Volontairement vide au depart : un script qui n'a cree aucun fichier
+#: temporaire n'a rien a nettoyer. L'initialisation reste neanmoins
+#: necessaire, `osd_register_cleanup` concatene sans tester -- mais par
+#: Constance, non par `set -u`, que ce shell ne pose plus.
 _osd_cleanup_list=''
 
 osd_register_cleanup() {
@@ -54,8 +92,8 @@ osd_register_cleanup() {
     # Pump) : les fichiers temporaires du script sont, eux, deja
     # enregistres par `osd_tmpfile`.
     #
-    # La liste est une chaine et non un tableau, `set -u` etant actif et
-    # aucun `local` n'etant disponible en POSIX sh.
+    # La liste est une chaine et non un tableau : aucun `local` n'etant
+    # disponible en POSIX sh, on evite des expansions risquées.
     _osd_cleanup_list="${_osd_cleanup_list}
 $1"
 }
@@ -156,7 +194,7 @@ osd_rows_file() {
 osd_die() {
     # $1 = message, $2 = code de sortie
     printf 'OSD_FATAL=%s\n' "$1" >&3 2>/dev/null || true
-    exit "$2"
+    osd_exit "${2:-1}"
 }
 
 osd_have() {
@@ -224,9 +262,25 @@ osd_tmpfile() {
     return 1
 }
 
-# `$?` est developpe **avant** l'appel, donc il vaut bien le code de
-# sortie qui declenche le trap, et non celui du `rm` de nettoyage. Le
-# statut du script reste donc celui de `exit`, et non 0.
-trap 'osd_finish $?' 0
+# --- transport du code de sortie -------------------------------------------
+# Le trap doit annoncer le code REEL, et non `$?`.
+#
+# Mesure sur AIX 7.2 (Bourne shell), le trap de sortie ne recoit pas le
+# code du `exit` : il y trouve le statut de la derniere commande executee
+# avant lui. Un `exit 70` y est donc annonce `rc=0`, comme une sortie
+# normale. L'analyseur, qui tire son verdict de `OSD_RESULT_END rc=`,
+# ne pouvait alors plus distinguer un succes d'un echec — et le protocole
+# repose entierement sur ce marqueur.
+#
+# Le code voyage donc explicitement : `osd_exit` le memorise avant de
+# quitter, et le trap le restitue. Sur ksh93, `$?` donnerait le meme
+# resultat, mais une seule forme pour tous les shells evite d'avoir a
+# savoir lequel est en service.
+_osd_exit_code=0
+osd_exit() {
+    _osd_exit_code="$1"
+    exit "$1"
+}
+trap 'osd_finish $_osd_exit_code' 0
 
 printf 'OSD_RESULT_BEGIN\n' >&3 2>/dev/null || true

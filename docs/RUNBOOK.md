@@ -24,6 +24,19 @@ retient que les codes `ORA-`/`UDI-`, qui ne dépendent pas de la langue.
 Pour la sortie brute, lire le journal Data Pump sur l'hôte, dans le répertoire
 du `DIRECTORY` : `osd_<run-id>_export.log`, `osd_<run-id>_import.log`.
 
+**Un échec qui ne ressemble à aucun codes Oracle.** L'étape 4 ou 5 annonce
+alors « aucune métadonnée retournée » alors que la base répond très bien. Ce
+message désigne l'outil, et la cause est presque toujours dans le script
+distant : il a échoué **avant** d'interroger Oracle — un argument manquant,
+un client absent du `PATH`, un fichier temporaire impossible à créer.
+
+Le script.remote écrit alors `OSD_FATAL=<cause>` dans le bloc de résultat, et
+l'adaptateur Oracle le remonte tel quel. Si ce message réapparaît sous une
+autre forme, regarder le `0403-` ou le `0404-` sur stderr dans le journal de
+l'étape : ce sont les codes d'erreur du Bourne shell d'AIX, et ils nomment la
+ligne fautive. Voir `docs/REMOTE_PROTOCOL.md` pour les particularités de ce
+shell.
+
 ## Étape 2 — configuration
 
 **Cle inconnue.** Le fichier est un parseur strict. Une faute de frappe est une
@@ -144,6 +157,19 @@ n'est pas une garantie de place.
 L'espace vérifié est celui du `DIRECTORY` côté source, puis celui des
 tablespaces imposés côté cible. Les deux sont contrôlés parce qu'un export
 échoue sur le premier bien avant l'import.
+
+**« Espace non mesurable » alors que le chemin existe.** C'est le symptôme
+d'un `df -k` mal lu, pas d'un disque plein. Sur AIX, `df -k` n'affiche **pas**
+la colonne `Used` : `Free` occupe le troisième champ et le quatrième est le
+pourcentage d'occupation. Un lecteur qui prend les champs à position fixe
+comme sur Linux obtient « 42% » là où il attendait un compte de blocs, et la
+validation rejette le résultat.
+
+Le corps de `remote_space.sh` reconnaît donc la disposition sur le caractère du
+quatrième champ, et publie `OSD_DF_LAYOUT` (`aix` ou `posix`) pour que la
+cause reste visible. Si ce contrôle réapparaît après une mise à jour, c'est
+que la détection a été perdue : vérifier les colonnes réelles du `df` de
+l'hôte avant de conclure à un problème de place.
 
 ## Étape 11 — export
 

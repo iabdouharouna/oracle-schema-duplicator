@@ -25,11 +25,14 @@ osd_tool=${1:-}
 osd_parfile=${2:-}
 osd_timeout=${3:-0}
 
-# `${N:-}` plutot que `$N` : sous le `set -u` du prelude, un argument
-# manquant arreterait le script sur « unbound variable », avec un code 1
-# indistinct d'une erreur interne et sans `OSD_FATAL` — donc sans dire
-# a l'exploitant ce qu'il doit corriger. Le code 64, lui, signifie
-# « invocation incorrecte ».
+# `${N:-}` plutot que `$N` : l'absence d'argument doit se voir par un
+# controle explicite, qui emet un `OSD_FATAL` nommant l'argument et un
+# code 64 — « invocation incorrecte », distinct d'une erreur interne.
+# Une lecture nue de `$N` laisserait passer une chaine vide et ferait
+# echouer l'outil sans dire a l'exploitant ce qu'il doit corriger. La
+# forme `${N:-}` reste la bonne quelle que soit la politique du prelude
+# sur `set -u` : c'est elle qui fournit la chaine vide sur laquelle porte
+# ce controle.
 if [ -z "$osd_tool" ] || [ -z "$osd_parfile" ]; then
     osd_die "remote_datapump: arguments incomplets" 64
 fi
@@ -124,11 +127,30 @@ fi
 
 osd_stdout=$(osd_tmpfile dpout) || osd_die "fichier temporaire impossible" 70
 
+# stdin est ferme sur `/dev/null`, et c'est **indispensable**.
+#
+# Le client Data Pump accuse reception d'un `userid` de la forme
+# « / as sysdba » — une connexion authentifiee par le systeme
+# d'exploitation, seule forme acceptee sur ces hotes — en affichant
+# « Password: ». La connexion aboutit (OS), mais le client consomme
+# quand meme une ligne sur stdin.
+#
+# Herite via Ansible, stdin n'est ni un terminal ni un fichier clos : la
+# lecture ne rend jamais la main, et l'export ne se termine jamais. C'est
+# un blocage, pas une lenteur : mesure sur l'hote, le meme export sans
+# redirection de stdin n'a pas rendu la main en 240 s, et en 66 s avec
+# elle, pour un schema de 2 Mo.
+#
+# `< /dev/null` rend la lecture instantanee (fin de fichier). Le client
+# garde le `userid` du parfile et se connecte par le systeme
+# d'exploitation : aucune saisie n'est reellement attendue.
 if [ "$osd_use_timeout" -eq 1 ]; then
-    timeout "$osd_timeout" "$osd_tool" parfile="$osd_parfile" >"$osd_stdout" 2>&1
+    timeout "$osd_timeout" "$osd_tool" parfile="$osd_parfile" \
+        < "/dev/null" >"$osd_stdout" 2>&1
     osd_rc=$?
 else
-    "$osd_tool" parfile="$osd_parfile" >"$osd_stdout" 2>&1
+    "$osd_tool" parfile="$osd_parfile" \
+        < "/dev/null" >"$osd_stdout" 2>&1
     osd_rc=$?
 fi
 
@@ -181,4 +203,4 @@ fi
 # `osd_stdout` est deja declare par `osd_tmpfile` ; le fichier de codes
 # ne l'est pas, il etant produit par une redirection dans le corps.
 rm -f "$osd_stdout.codes" 2>/dev/null || true
-exit "$osd_rc"
+osd_exit "$osd_rc"

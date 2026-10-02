@@ -4,7 +4,7 @@ C'est la couche la plus exposee du projet : elle envoie du texte a un
 shell, sur une machine qu'elle ne controle pas, pour le compte d'une
 base de production. Une erreur ici ne se manifeste pas par un echec
 propre mais par une **degradation silencieuse** : un script qui ne
-tourne pas sur `ksh93`, un quoting qui perd un octet d'un nom de
+tourne pas sur le Bourne shell d'AIX, un quoting qui perd un octet d'un nom de
 fichier, une variable d'environnement posee apres le prelude et donc
 sans effet.
 
@@ -247,7 +247,7 @@ class TestBuildScript(unittest.TestCase):
         """`sh -n` sur l'assemblage complet, prelude compris.
 
         Le prelude et le corps sont ecrits separement mais n'ont de
-        sens qu'ensemble : `set -u`, le `trap`, et la redirection
+        sens qu'ensemble : le `trap`, `osd_exit` et la redirection
         `exec 1>&2` ne sont interpretables qu'une fois concatenees.
         Verifier le corps seul laisserait passer un script qui ne
         compile qu'isole.
@@ -341,7 +341,39 @@ class TestBuildScript(unittest.TestCase):
     def test_le_prelude_est_present_et_precede_le_corps(self):
         script = build_script("# corps\n", ["x"])
         self.assertLess(script.index("OSD_RESULT_BEGIN"), script.index("# corps"))
-        self.assertIn("trap 'osd_finish $?' 0", script)
+        self.assertIn('osd_exit', script)
+
+    def test_le_trap_porte_le_code_explicitement_et_non_le_statut_du_shell(self):
+        """Le code doit voyager par `osd_exit`, pas par `$?` developpe au trap.
+
+        Sur le Bourne shell d'AIX, `$?` n'est pas mis a jour pour le trap
+        de sortie : il y garde le statut de la derniere commande executee
+        avant le `exit`, presque toujours 0. Un `trap 'osd_finish $?' 0`
+        y annoncerait donc `rc=0` pour un echec, et l'analyseur ne pourrait
+        plus distinguer une reussite d'un echec.
+        """
+        script = build_script("# corps\n", ["x"])
+        self.assertIn("trap 'osd_finish $_osd_exit_code' 0", script)
+        self.assertNotIn("trap 'osd_finish $?' 0", script)
+        # `osd_exit` doit aussi etre le chemin de sortie de `osd_die`,
+        # sinon un `osd_die` resterait muet sur le code.
+        self.assertIn('osd_exit "${2:-1}"', script)
+
+    def test_le_prelude_n_active_pas_set_u(self):
+        """`set -u` est incompatible avec le Bourne shell d'AIX.
+
+        Ce shell leve une erreur sur toute expansion d'un parametre non
+        defini, y compris `${VAR:-defaut}`. Le prelude s'en abstient donc,
+        et passe en `set +u` : c'est la seule forme qui ne casse pas les
+        scripts sur AIX.
+        """
+        script = build_script("# corps\n", ["x"])
+        self.assertIn("set +u", script)
+        # `set -u` ne doit pas apparaitre comme instruction active : il ne
+        # le serait que dans un commentaire ou une explication.
+        actives = [l for l in script.split("\n")
+                   if l.strip().startswith("set -u")]
+        self.assertEqual(actives, [], f"`set -u` actif : {actives}")
 
 
 class TestProfilDeConnexion(unittest.TestCase):
@@ -412,16 +444,17 @@ class TestProfilDeConnexion(unittest.TestCase):
         self.assertEqual(resultat.get("OU_TROUVE"), str(attendu))
 
     def test_une_variable_non_initialisee_dans_le_profil_ne_bloque_pas(self):
-        """Le sourcing precede `set -u`, et l'ordre est la raison d'etre.
+        """Un profil qui lit une variable jamais definie ne bloque rien.
 
-        Un profil n'ecrit pas toujours des variables qu'il initialise
+        Un profil n'ecrit pas toujours les variables qu'il initialise
         lui-meme : un `$LD_PRELOAD` ou un `$NLS_LANG` conditionnel laisse
-        la variable non definie. Sourced apres `set -u`, cela tuerait le
-        script avant meme le prelude -- donc avant tout resultat, donc
-        avant le moindre message : un echec muet, sans bloc de resultat
-        a analyser.
+        la variable non definie. Sous `set -u`, cela tuerait le script
+        avant meme le prelude -- donc avant tout resultat, donc avant le
+        moindre message : un echec muet, sans bloc de resultat a analyser.
 
-        On verifie que le script **aboutit**, pas l'ordre des lignes.
+        Le contournement retenu est general, pas un ordre de lignes :
+        le prelude pose `set +u`, ce qui rend cette lecture inoffensive
+        sur tous les shells.
         """
         self._profil('echo "NLS_LANG=$NLS_LANG_ABSENTE" >/dev/null 2>&1\n')
         resultat = self._executer("osd_kv VECU 1\nosd_finish 0\n")
@@ -507,7 +540,7 @@ class TestInjection(unittest.TestCase):
     def test_un_argument_ne_peut_pas_ajouter_une_instruction(self):
         """Un `\n` dans un argument ne peut pas ajouter une instruction.
 
-        Le prelude utilise `set -u` mais pas `set -e` : une instruction
+        Le prelude n'utilise ni `set -u` ni `set -e` : une instruction
         supplementaire s'executerait sans erreur, et poserait une
         variable supplementaire dans le bloc. C'est la forme
         d'injection la plus simple, et la seule qui ne passe par aucun
@@ -660,7 +693,15 @@ class TestEnvironnementDuScript(unittest.TestCase):
 
 
 class TestPortabiliteDesScripts(unittest.TestCase):
-    """Les scripts distants partent sur AIX, ou `/bin/sh` est ksh93."""
+    """Les scripts distants partent sur AIX, ou `/bin/sh` est le Bourne shell.
+
+Pas ksh93 : c'est le Bourne shell qui est en service, et il se distingue du
+ksh93 sur deux points qui ne se voient pas à la relecture — `set -u` y rend
+illicite toute expansion d'un paramètre non défini, et le trap de sortie n'y
+reçoit pas le code de sortie. Ces deux points sont traités par le prelude et
+couverts par des tests dédiés ; ce qui reste ici, c'est l'inventaire des
+constructions que le Bourne shell refuse.
+"""
 
     def setUp(self):
         self.dossier = SRC_DIR.parent / "shell"
@@ -1314,8 +1355,16 @@ class TestExecutionLocaleDeReference(unittest.TestCase):
         self.assertEqual(resultat.rc, 0)
 
     def test_un_code_de_sortie_non_nul_est_conserve(self):
+        """Le code doit ressortir par `osd_exit`, pas par un `exit` nu.
+
+        Un `exit 7` ecrit directement dans le corps est tolere (le trap
+        le voit sur les shells POSIX corrects) mais n'est plus la forme
+        attendue : c'est `osd_exit 7` qui garantit le code sur tous les
+        shells, Bourne d'AIX compris. Le test porte donc sur `osd_exit`,
+        et verifie en prime que le `rc` du bloc vaut bien 7.
+        """
         resultat = LocalRunner().run_script(
-            build_script("osd_kv OSD_X 1\nexit 7\n", ["x"]), timeout=60
+            build_script("osd_kv OSD_X 1\nosd_exit 7\n", ["x"]), timeout=60
         )
         self.assertEqual(resultat.rc, 7)
         self.assertFalse(resultat.ok)

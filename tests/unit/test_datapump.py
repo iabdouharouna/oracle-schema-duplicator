@@ -1007,6 +1007,57 @@ class TestInterpretation(unittest.TestCase):
             stderr="Job SYS_EXPORT_TABLE_01 completed successfully")
         self.assertEqual(resultat.error_codes, [])
 
+    def test_un_code_sans_gravite_ne_fait_pas_echouer_le_job(self):
+        """`ORA-39173` est une remarque, pas un defaut du dump.
+
+        Le client ecrit ce code quand une colonne chiffree est deposee en
+        clair dans le fichier de dump. Le job se termine en `COMPLETED`
+        et le dump se relu integralement : le fichier est complet, il est
+        simplement moins confidentiel que la source.
+
+        Le compter comme une erreur faisait echouer l'export d'un schema
+        `HR` parfaitement sain, avec un code de retour 4 « echec de
+        l'export » et un remede — « consulter le journal Data Pump » —
+        qui ne designait aucun probleme. C'est le pire des deux : un
+        rapport qui se trompe, et dont l'exploitant ne peut pas se servir.
+        """
+        resultat = self._interpret(
+            rc=2, kv={"OSD_ERROR_CODES": "ORA-39173"},
+            tool="expdp",
+        )
+        self.assertEqual(resultat.error_codes, [])
+        # Le fait reste visible : une note de confidentialite ne doit
+        # ni faire echouer le run, ni disparaitre du rapport.
+        self.assertIn("ORA-39173", str(resultat.warnings))
+
+    def test_un_code_sans_gravite_n_efface_pas_une_vraie_erreur(self):
+        """Le filtrage porte sur chaque code, pas sur la sortie entiere.
+
+        Un run peut afficher l'avertissement de confidentialite **et**
+        echouer reelsement. Ecouter le code benign comme une autorisation
+        de declarer le job reussi ferait passer une erreur pour un
+        succes — l'inverse exact du defaut corrige ci-dessus.
+        """
+        resultat = self._interpret(
+            rc=2, kv={"OSD_ERROR_CODES": "ORA-39173 ORA-39002"},
+            tool="expdp",
+        )
+        self.assertEqual(resultat.error_codes, ["ORA-39002"])
+        self.assertIn("ORA-39173", str(resultat.warnings))
+
+    def test_la_liste_des_codes_benins_est_ferme(self):
+        """Aucun code n'y entre par deduction.
+
+        Un code ajoute « parce qu'il ressemble a un avertissement »
+        declarerait complet un dump qui ne l'est pas. La liste est donc
+        revue, et son contenu se justifie par une observation.
+        """
+        from osd.adapters.datapump import DATAPUMP_BENIGN_CODES
+
+        self.assertEqual(DATAPUMP_BENIGN_CODES, frozenset({"ORA-39173"}))
+        for code in DATAPUMP_BENIGN_CODES:
+            self.assertRegex(code, r"^ORA-\d+$")
+
     def test_un_bloc_vide_renvoie_aucun_code_et_aucune_erreur(self):
         resultat = self.adapter._interpret(Result(rc=0, kv={}), tool="expdp",
                                           job_name="J")

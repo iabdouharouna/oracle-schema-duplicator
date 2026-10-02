@@ -20,7 +20,7 @@ osd_path=$(command -v "$osd_bin" 2>/dev/null || true)
 if [ -n "$osd_path" ]; then
     osd_kv OSD_FOUND 1
     osd_kv OSD_PATH "$osd_path"
-    exit 0
+    osd_exit 0
 fi
 
 osd_kv OSD_FOUND 0

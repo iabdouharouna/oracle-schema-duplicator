@@ -19,11 +19,12 @@
 # presence du fichier : une copie tronquee doit etre detectee, ce qu'un
 # simple `test -f` ne ferait pas.
 
-# `${N:-}` et non `$N` : sous le `set -u` du prelude, un argument
-# manquant arreterait le script sur « unbound variable » avant tout
-# controle, avec un code 1 indistinct d'une erreur interne et sans
-# `OSD_FATAL`. Le code 64, lui, signifie « invocation incorrecte » et
-# se distingue des autres.
+# `${N:-}` et non `$N` : l'absence d'argument doit se voir par un controle
+# explicite, qui produit un code 64 (« invocation incorrecte ») et un
+# `OSD_FATAL` nommant l'argument. Une lecture nue de `$N` donnerait un
+# code 1, indistinct d'une erreur interne. La forme `${N:-}` reste la bonne
+# quelle que soit la politique du prelude sur `set -u` : c'est elle qui
+# fournit la chaine vide sur laquelle porte ce controle.
 osd_op=${1:-}
 osd_dir=${2:-}
 osd_name=${3:-}
@@ -97,4 +98,4 @@ remove)
     ;;
 esac
 
-exit 0
+osd_exit 0

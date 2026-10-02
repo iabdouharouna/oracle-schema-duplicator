@@ -70,7 +70,7 @@ inventory/
   stages/pipeline.py        l'enchaînement des 19 étapes
   report/                   construction du document, rendu texte
 shell/                      scripts POSIX sh exécutés chez la base
-  prelude.sh                contrat d'exécution : set -u, trap, canal machine
+  prelude.sh                contrat d'exécution : trap, osd_exit, canal machine
   remote_*.sh               un fichier par famille d'opérations
 ```
 
@@ -169,7 +169,7 @@ trouver de trace de diagnostic.
 | Topologie | Condition | `method` | `backend` |
 |-----------|-----------|----------|-----------|
 | Les deux côtés voient le même DIRECTORY | deux `LocalRunner` | `partage` | `local` |
-| Au moins un côté est distant | — | `relais` | `scp`/`rsync`/`sftp` |
+| Au moins un côté est distant | — | `relais` | `rsync`/`scp-legacy`/`scp` |
 | Un côté local, un côté distant | — | refusée | — |
 
 La topologie mixte est **refusée**, et non traitée comme `partage` : c'est la
@@ -185,6 +185,30 @@ place.
 `AUTO` sonde réellement les backends (écriture + relecture + suppression d'un
 fichier d'échantillon minuscule) plutôt que de se fier à la présence du binaire :
 un `scp` installé peut ne pas fonctionner si le `sshd` n'expose pas `sftp`.
+
+**Les deux extrémités sont désignées comme des hôtes distants.** La commande
+produite est `scp oracle@source:/exp/f.dmp admin@cible:/imp/f.dmp`. La seconde
+forme n'est pas un détail : un chemin nu désigne un chemin *du serveur de saut*,
+où le répertoire d'import n'existe généralement pas. Le client échouait alors sur
+un message de fichier introuvable ou de droit refusé, qui ne parle que de la
+destination et envoie l'exploitant vérifier des permissions sur le mauvais hôte.
+
+**`sftp` ne peut pas écrire à distance.** Son script ne connaît qu'un seul hôte :
+`get` y télécharge, et le second chemin est local au serveur de saut. Il est donc
+refusé en `relais` — le nom reste dans le compte rendu des tentatives, pour qu'un
+`TRANSFER_MODE=sftp` pose par l'exploitant ne devienne pas muet, mais la raison
+nomme la limite du client.
+
+**`scp` reçoit `-3`, `rsync` n'en a pas besoin.** C'est la distinction que le
+client impose, pas un choix d'uniformisation. Sans `-3`, `scp` fait ouvrir la
+seconde session `ssh` **par la source**, avec la clé de la source ; sur deux hôtes
+qui ne se connaissent pas, l'échec est `Permission denied` — un message
+d'authentification qui envoie vers les mots de passe, alors que poser une clé
+entre les deux hôtes serait une ouverture inutile. `-3` fait passer les deux
+sauts par le serveur de saut, qui possède déjà les deux clés. `rsync` fait déjà
+passer un transfert distant-à-distant par la machine qui l'a lancé. Aucune clé
+n'est donc distribuée entre les hôtes : le serveur de saut reste le seul point
+d'authentification.
 
 ## Secrets
 
