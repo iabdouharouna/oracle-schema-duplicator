@@ -190,6 +190,14 @@ class Pipeline:
 
         set_step("19-retour-code")
         self.state.final_code = ec.SUCCESS
+        # Un run qui s'acheve en succes ne doit conserver aucune erreur.
+        # Sur une reprise, l'etat relu porte l'`error` de la tentative
+        # precedente : sans cet effacement, le rapport affichait une
+        # section « Erreur » sous un verdict SUCCES, et un ordonnanceur
+        # qui lit l'etat croyait le run encore en echec. Le cas a ete
+        # observe sur un vrai `resume` : final_code=0 et 19 etapes
+        # `done`, mais `state.error` decrivait encore l'import precedent.
+        self.state.error = None
         return ec.SUCCESS
 
     def _dispatch(self, index: int, name: str) -> None:

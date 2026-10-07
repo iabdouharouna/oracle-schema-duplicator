@@ -1892,6 +1892,36 @@ class TestReprise(CasDeTest):
         retraits = [sc for sc in s.source_runner.mutations() if "unlink" in sc]
         self.assertTrue(retraits, "le dump de la reprise n'a pas ete nettoye")
 
+    def test_une_reprise_reussie_efface_l_erreur_de_la_tentative_precedente(self):
+        """Un run vert ne doit pas trainer l'erreur de l'echec anterieur.
+
+        L'etat est relu au debut d'un `resume` : s'il portait l'`error`
+        de la tentative precedente et qu'aucune branche ne l'effacait, le
+        rapport affichait une section « Erreur » sous un verdict SUCCES,
+        et un ordonnanceur qui lit l'etat croyait le run encore en echec.
+
+        Constat fait sur un vrai `resume` : `final_code=0` et les dix-neuf
+        etapes `done`, mais `state.error` decrivait encore l'import
+        precedent, et le rapport imprimait son remede sous « SUCCES ».
+        """
+        s = self.nouveau(resume=True)
+        s.deja_avance(13)
+        s.artefacts_de_datapump()
+        # La tentative precedente s'etait arretee sur l'import.
+        s.state.error = {"code": ec.IMPORT, "message": "impdp n'a pas abouti"}
+        s.state.final_code = ec.IMPORT
+
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        self.assertIsNone(
+            s.state.error,
+            "l'erreur de la tentative precedente survit au succes",
+        )
+        self.assertEqual(s.state.final_code, ec.SUCCESS)
+
+        from osd.report import render_text
+
+        self.assertNotIn("Erreur", render_text(s.rapport()))
+
     def test_un_echec_de_cette_invocation_conserve_encore_le_dump(self):
         """Le symetrique : la protection du dump ne doit pas disparaitre.
 
