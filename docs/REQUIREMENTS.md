@@ -34,6 +34,11 @@ Supporté :
 - **RAC / SCAN** — DESCRIPTION complète, comme n'importe quel alias.
 - `service_name` et port configurables.
 - `SOURCE_SYSDBA` / `TARGET_SYSDBA`, pour les cas où l'administrateur l'exige.
+- **Authentification OS** — `SOURCE_OS_AUTH=true` / `TARGET_OS_AUTH=true` :
+  connexion locale `/` par l'identité du compte d'exploitation, sans chaîne ni
+  wallet. Mesure sur les hôtes : `/ as sysdba` répond, `/@alias as sysdba` est
+  refusé en `ORA-01017`. Exclusive : la validation refuse de la combiner avec
+  `_CONNECT` ou `_WALLET`.
 
 `BatchMode=yes` est **exigé**, pas recommandé : sans lui une erreur
 d'authentification ouvre une invite et le run reste bloqué jusqu'à l'expiration

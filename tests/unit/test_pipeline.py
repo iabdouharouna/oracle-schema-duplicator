@@ -628,6 +628,57 @@ class TestSpecificationDImport(CasDeTest):
         self.assertIn("<parties>", s.pipeline._spec_dimport())
 
 
+class TestAuthentificationOS(CasDeTest):
+    """`*_OS_AUTH` au travers du pipeline : rapport et connexion.
+
+    La validation refuse de combiner `OS_AUTH` avec `CONNECT`/`WALLET` ;
+    ce qui reste a prouver ici est que le pipeline la **porte** : le
+    rapport affiche le fait (et non une chaine vide), et le `OracleSide`
+    construit rend bien `/`, la seule forme mesuree saine.
+    """
+
+    def test_le_rapport_dit_os_au_lieu_d_une_chaine_vide(self):
+        """Afficher « authentification OS », pas un blanc.
+
+        Sans cette ligne, `source :  / schema HR` ferait croire a un
+        oubli de configuration quand `OS_AUTH` est un choix — et le
+        rapport est lu par celui qui detecte les oublis.
+        """
+        s = self.nouveau(config={
+            "SOURCE_CONNECT": "", "TARGET_CONNECT": "",
+            "SOURCE_OS_AUTH": "true", "TARGET_OS_AUTH": "true",
+        })
+        from osd.report import render_text
+
+        self.assertEqual(s.state.source, "authentification OS")
+        self.assertEqual(s.state.target, "authentification OS")
+        self.assertIn(
+            "source      : authentification OS / schema SRC",
+            render_text(s.rapport()),
+        )
+
+    def test_sans_os_auth_le_rapport_porte_la_chaine(self):
+        """Le mode normal n'est pas derange par l'alternative."""
+        s = self.nouveau()
+        self.assertEqual(s.state.source, "L_SRC")
+        self.assertEqual(s.state.target, "L_TGT")
+
+    def test_le_cote_construit_ose_la_connexion_os(self):
+        """`effective_connect` rend `/ as sysdba` des la construction.
+
+        Le pipeline est le seul endroit ou la decision de
+        configuration devient une decision de connexion : la branche
+        appartient a `OracleSide`, mais c'est ici qu'elle doit etre
+        alimentee.
+        """
+        s = self.nouveau(config={"SOURCE_CONNECT": "", "SOURCE_OS_AUTH": "true"})
+        cote = s.pipeline._make_side("source")
+        self.assertTrue(cote.os_auth)
+        self.assertEqual(cote.connect, "")
+        self.assertEqual(cote.effective_connect(), "/ as sysdba")
+        self.assertFalse(s.pipeline._make_side("cible").os_auth)
+
+
 class TestCheminNominal(CasDeTest):
     def test_les_dix_neuf_etapes_sont_executees(self):
         s = self.nouveau()

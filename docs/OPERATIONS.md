@@ -113,6 +113,18 @@ Pour un alias TNS, `SOURCE_TNS_ADMIN` est **transmis à l'hôte** : c'est le
 `TNS_ADMIN` local du serveur de saut qui ne sert à rien, et son oubli produit
 un `ORA-12154` que rien dans le rapport ne permet de rattacher à sa cause.
 
+### Authentification OS
+
+`SOURCE_OS_AUTH=true` (resp. `TARGET_OS_AUTH=true`) remplace **les deux**
+formes précédentes par une connexion locale `/` : l'identité est celle du
+compte d'exploitation (`oracle`, souvent) sur la machine qui exécute le
+client. Elle ne convient que si ce compte a les droits nécessaires — mesuré :
+`/ as sysdba` répond, `/@alias as sysdba` est refusé en `ORA-01017`.
+
+La combinaison avec `_CONNECT` ou `_WALLET` est **refusée à la lecture** : une
+chaîne ou un wallet désignent une identité qui contredit `/`. Le rapport
+affiche alors `authentification OS` là où une chaîne serait montrée.
+
 ## Comptes et secrets
 
 Le compte connecté est un compte **de duplication**, pas `SYS`. Il lui faut :

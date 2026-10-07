@@ -493,6 +493,11 @@ def _unwrap_ansible(stdout: str, stderr: str) -> tuple:
     Le retour est un triplet `(stdout, stderr, failed)`. `stdout` est
     **vide** si le JSON est absent ou illisible : c'est au texte
     d'origine de faire le diagnostic, plutot qu'a un parsing qui reussirait.
+
+    Quand le payload annonce un echec, son `msg` est reporte en fin de
+    `stderr` : sur un hote injoignable, le `stderr` du payload est vide
+    et rien d'autre ne nomme la cause — le detail ne se serait alors
+    reduit qu'au hint generique, sans une seule ligne de motif.
     """
     payload = _premier_json(stdout)
     if not isinstance(payload, dict):
@@ -504,6 +509,12 @@ def _unwrap_ansible(stdout: str, stderr: str) -> tuple:
     inner_out = payload.get("stdout", "")
     inner_err = payload.get("stderr", "")
     failed = bool(payload.get("failed")) or bool(payload.get("unreachable"))
+    msg = payload.get("msg")
+    if failed and isinstance(msg, str) and msg.strip():
+        # En queue, et non en tete : `_parse_result` ne lit que le bloc
+        # machine, et le detail de `PrereqError` ne retient que les
+        # dernieres lignes.
+        inner_err = (inner_err + "\n" if inner_err else "") + msg
     return inner_out, (inner_err + stderr), failed
 
 

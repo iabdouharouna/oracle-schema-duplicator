@@ -848,6 +848,36 @@ class TestCeQueLeClientVoit(unittest.TestCase):
         rapport = lire_rapport(Path(resultat.parfile))
         self.assertEqual(rapport.get("LIGNE_USERID"), '"/@L_SRC"')
 
+    def test_l_authentification_os_ne_porte_ni_chaine_ni_identite(self):
+        """`userid="/ as sysdba"` — rien d'autre qu'une barre.
+
+        Mesure : `/ as sysdba` est la seule forme d'OS auth acceptee ;
+        `/@alias as sysdba` est refusee en ORA-01017. Le parfile doit
+        donc porter exactement cette forme, sans chaine ni compte qui
+        pourrait fuir dans un journal — c'est la chaine la plus courte
+        qui decrive une connexion.
+        """
+        self.oracle.side.os_auth = True
+        self.oracle.side.wallet = ""
+        self.oracle.side.connect = ""
+        resultat = self._lancer(self._export())
+        rapport = lire_rapport(Path(resultat.parfile))
+        self.assertEqual(rapport.get("LIGNE_USERID"), '"/ as sysdba"')
+
+    def test_effective_connect_os_est_une_barre_avec_suffixe(self):
+        """La barre seule, puis ` as sysdba` selon l'option.
+
+        Le suffixe est le meme mecanisme que pour le wallet : c'est la
+        **connexion** qui change, pas le reste de la chaine.
+        """
+        side = OracleSide(
+            name="source", connect="ALIAS", schema="HR", directory="DP_DIR",
+            os_auth=True, sysdba=True,
+        )
+        self.assertEqual(side.effective_connect(), "/ as sysdba")
+        side.sysdba = False
+        self.assertEqual(side.effective_connect(), "/")
+
     def test_les_cles_transmises_sont_les_cles_attendues(self):
         """L'inventaire compare, pas l'absence.
 

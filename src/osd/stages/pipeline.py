@@ -132,8 +132,12 @@ class Pipeline:
 
     def __post_init__(self) -> None:
         self.state.dry_run = self.dry_run
-        self.state.source = str(self.cfg.get("SOURCE_CONNECT", ""))
-        self.state.target = str(self.cfg.get("TARGET_CONNECT", ""))
+        # `_OS_AUTH` ne porte pas de chaine : le rapport doit quand meme
+        # dire comment la connexion est faite, sans quoi la ligne
+        # `source :  / schema HR` ferait croire a un oubli de
+        # configuration alors que l'authentification OS est un choix.
+        self.state.source = _connect_affiche(self.cfg, "SOURCE")
+        self.state.target = _connect_affiche(self.cfg, "TARGET")
         self.state.source_schema = str(self.cfg.get("SOURCE_SCHEMA", ""))
         self.state.target_schema = str(self.cfg.get("TARGET_SCHEMA", ""))
 
@@ -1526,6 +1530,7 @@ class Pipeline:
             user=str(self.cfg.get(f"{prefix}_USER", "")),
             tns_admin=str(self.cfg.get(f"{prefix}_TNS_ADMIN", "")),
             sysdba=bool(self.cfg.get(f"{prefix}_SYSDBA")),
+            os_auth=bool(self.cfg.get(f"{prefix}_OS_AUTH")),
             runner=runner,
         )
 
@@ -1565,6 +1570,25 @@ def _mot_de_passe_ssh(runner) -> str:
         return methode() or ""
     except Exception:  # pragma: no cover - le runner reporte lui-meme
         return ""
+
+
+#: Libelle du rapport pour une connexion par identite du systeme.
+_AUTH_OS = "authentification OS"
+
+
+def _connect_affiche(cfg, prefix: str) -> str:
+    """Chaine montree au rapport pour un cote de la duplication.
+
+    `CONNECT` est la valeur habituelle. En authentification OS, il n'y a
+    pas de chaine : afficher le fait plutot que le vide, sans quoi le
+    rapport dirait « source :  / schema HR » et laisserait croire a un
+    oubli de configuration quand c'est un choix. C'est le seul usage de
+    `SOURCE_CONNECT`/`TARGET_CONNECT` dans le rapport : le pipeline
+    porte la chaine, il doit donc aussi porter son absence.
+    """
+    if cfg.get(f"{prefix}_OS_AUTH"):
+        return _AUTH_OS
+    return str(cfg.get(f"{prefix}_CONNECT", ""))
 
 
 def _lit(value: str) -> str:

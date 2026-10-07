@@ -277,6 +277,35 @@ class TestLectureDeLaSortie(unittest.TestCase):
         self.assertIn("ORA-12345", stderr)
         self.assertIn("vault", stderr)
 
+    def test_le_msg_d_un_payload_en_echec_est_reporte(self):
+        """Sur un hote injoignable, le motif est dans `msg`, et la ailleurs.
+
+        Quand la connexion echoue avant le script, Ansible remplit `msg`
+        et laisse le `stderr` du payload **vide** : ne rapporter que ce
+        `stderr` donnait un detail sans aucune ligne de cause, et
+        l'echec se lisait comme un probleme d'inventaire generique —
+        c'est ce qui s'est vu sur un import dont le script avait
+        pourtant tourne jusqu'au bout.
+        """
+        from osd.adapters.ansible_runner import _unwrap_ansible
+
+        motif = "Failed to connect to the host via ssh: [errno 255]"
+        _, stderr, failed = _unwrap_ansible(
+            sortie_json({"msg": motif, "unreachable": True, "changed": False,
+                         "stdout": "", "stderr": ""}),
+            "",
+        )
+        self.assertTrue(failed)
+        self.assertIn(motif, stderr)
+
+        # Un succes qui porte un `msg` (le resultat d'une expression)
+        # n'est pas un diagnostic : il ne doit rien ajouter.
+        _, stderr, failed = _unwrap_ansible(
+            sortie_json({"msg": "valeur", "failed": False}), "",
+        )
+        self.assertFalse(failed)
+        self.assertEqual(stderr, "")
+
     def test_une_sortie_sans_json_est_rendue_telle_quelle(self):
         """Pas de JSON ne signifie pas « echec » : le texte prime.
 
@@ -364,6 +393,36 @@ class TestEchecAvantLeScript(unittest.TestCase):
                     r.run_script(bloc, timeout=5)
             self.assertIn("inventaire", str(ctx.exception.hint).lower()
                           + str(ctx.exception).lower())
+
+    def test_le_detail_d_un_hote_injoignable_nomme_sa_cause(self):
+        """Le detail d'un echec anterieur au script contient le `msg`.
+
+        Sur un hote injoignable, Ansible laisse le `stderr` du payload
+        **vide** : le motif entier — refus d'authentification, host
+        inconnu, connexion refusee — tient dans `msg`. Ne rapporter que
+        le `stderr` donnait donc un detail **vide** : l'echec se
+        presentait sans une seule ligne de cause, derriere un hint
+        d'inventaire — c'est ce qui s'est vu sur un import dont le
+        script avait pourtant tourne jusqu'au bout, tue par un code 5
+        que sshpass interprete comme un mot de passe incorrect.
+
+        Le motif doit etre dans le detail, et le secret, lui, ne doit
+        pas y paraitre : c'est `redact` qui porte cette garantie, et le
+        motif d'Ansible ne contient aucun.
+        """
+        bloc = build_script(load_body("remote_which.sh"), ["expdp"], env={})
+        motif = "Invalid/incorrect password: connexion refusee"
+        sortie = sortie_json(
+            {"msg": motif, "unreachable": True, "changed": False,
+             "stdout": "", "stderr": ""}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            r = AnsibleRunner("localhost", inventory=str(inventaire_local(Path(tmp))))
+            with _Interception(FauxAnsible(stdout=sortie, returncode=4)):
+                with self.assertRaises(PrereqError) as ctx:
+                    r.run_script(bloc, timeout=5)
+            detail = "\n".join(ctx.exception.detail)
+            self.assertIn(motif, detail)
 
     def test_un_bloc_machine_present_renvoie_le_resultat(self):
         """L'echec du script est dans le bloc, pas dans le `rc` d'Ansible.

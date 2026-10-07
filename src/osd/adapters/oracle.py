@@ -51,18 +51,32 @@ class OracleSide:
     #: compte connecte et que les droits `EXP_FULL_DATABASE` ne sont pas
     #: accordes.
     sysdba: bool = False
+    #: Connexion par l'identite du systeme (`/`), sans chaine ni wallet.
+    #: La validation refuse de la combiner avec `CONNECT` ou `WALLET`,
+    #: mais la branche est posee **ici** et non dans le constructeur :
+    #: `OracleSide` est aussi construit par des tests et des adaptateurs
+    #: qui ne passent pas par la configuration, et la coherence doit
+    #: tenir meme quand la validation est contournee — la methode, elle,
+    #: l'est reellement par chaque connexion.
+    os_auth: bool = False
     runner: Any = None
     _connected: bool = field(default=False, repr=False)
 
     def effective_connect(self) -> str:
         """Chaine de connexion reellement transmise a SQL*Plus.
 
-        Le preference est donnee au wallet : `/@connect` ne contient aucun
-        mot de passe, ni dans la ligne de commande, ni dans le journal, ni
-        dans le processus distant. Le mot de passe en clair n'est accepte
-        que si aucun wallet n'est configure.
+        L'authentification OS prime tout : `/` laisse SQL*Plus et Data
+        Pump former l'identite dans le systeme d'exploitation lui-meme —
+        la seule forme qui ne transite ni chaine ni identite, et la
+        seule mesuree saine en `/ as sysdba`. La preference est ensuite
+        donnee au wallet : `/@connect` ne contient aucun mot de passe,
+        ni dans la ligne de commande, ni dans le journal, ni dans le
+        processus distant. Le mot de passe en clair n'est accepte que si
+        aucun wallet n'est configure.
         """
         suffix = self.privilege_suffix()
+        if self.os_auth:
+            return "/" + suffix
         if self.wallet:
             return self.wallet_connect() + suffix
         if self.password:

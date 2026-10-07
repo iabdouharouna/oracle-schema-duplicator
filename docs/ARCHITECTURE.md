@@ -210,6 +210,25 @@ passer un transfert distant-à-distant par la machine qui l'a lancé. Aucune cl�
 n'est donc distribuée entre les hôtes : le serveur de saut reste le seul point
 d'authentification.
 
+**Par mot de passe, chaque saut est une invocation séparée.** `sshpass` ne
+répond qu'à une seule invite par processus : mesuré, `scp -3` sous `sshpass`
+rend un rc 5 et un stderr vide — la seconde invitation du même processus est
+prise pour la preuve que le premier essai a été refusé. Quand un secret est
+fourni, le transfert est donc **coupé en deux** : une commande ne désigne
+qu'un hôte, et les deux sont reliées par un **dépôt local** sur le serveur de
+saut (`WORK_DIR/staging`, ou `/tmp/osd-staging` sans cache). Le `-3`
+disparaît, et `BatchMode=no` + `NumberOfPasswordPrompts=1` remplacent le
+`BatchMode=yes` du mode clé — une seule tentative, puis un échec franc, là où
+l'invite bloquait le run.
+
+Le dépôt est défendu deux fois : la place est vérifiée avant la **première**
+copie (`shutil.disk_usage` sur le dépôt), et le fichier est supprimé dans un
+`finally`, après succès comme après échec. Un dump porte les données du
+schéma : le laisser sur le serveur de saut le rendrait visible de tous les
+comptes de la machine, et un oubli s'accumulerait d'un run à l'autre. `PASSWORD`
+est exclu de ce chemin : il n'alimente que `effective_connect`, jamais le
+transfert.
+
 ## Secrets
 
 - `redact.py` est appelé par le formateur de logs, le rendu du rapport, la

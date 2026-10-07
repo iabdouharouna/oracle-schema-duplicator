@@ -214,6 +214,57 @@ class TestCanalMachine(CasDeTest):
         self.assertNotIn("OSD_DEUX_LIGNES", r.kv)
         self.assertNotIn("b", r.kv)
 
+    def test_un_code_fatal_pour_sshpass_est_devie_sans_toucher_au_bloc(self):
+        """Le code processus n'est ni 5 ni 255 ; le bloc porte le vrai.
+
+        Sous Ansible, le script sort par `sshpass`, qui renvoie son code
+        propre quand il reussit — et le plugin connection/ssh lit alors
+        5 comme « mot de passe incorrect » : la tache est declaree
+        injoignable, la sortie complete est jetee sans un mot et sans
+        retry, et l'echec se conclut sur un diagnostic muet sans rapport
+        avec la cause. `impdp` sort 5 quand le job aboutit avec des
+        erreurs : c'est le cas normal d'un import
+        `TABLE_EXISTS_ACTION=SKIP` sur un schema deja peuple, observe
+        sur une vraie 19c — l'import tournait et aboutissait, et le run
+        se concluait sur « hote injoignable ». 255, lui, y signifie
+        « la connexion ssh a echoue », donc reconnexions inutiles puis
+        echec.
+
+        Le code **processus** n'est donc que du transport : il doit
+        eviter ces deux valeurs. La verite machine reste dans
+        `OSD_RESULT_END rc=`, substituee au code processus par
+        `_parse_result` — c'est elle qui doit rendre 5, pas 71. Le cas
+        7 verrouille que rien d'autre n'est devie.
+        """
+        from osd.runner import _clean_env, _parse_result
+
+        for brut, transporte in ((5, 71), (255, 72), (7, 7)):
+            with self.subTest(code=brut):
+                script = build_script(f"osd_exit {brut}\n", ["x"], env={})
+                proc = subprocess.run(
+                    ["/bin/sh", "-s"],
+                    input=script.encode("utf-8"),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=60,
+                    env=_clean_env(),
+                )
+                resultat = _parse_result(
+                    proc.stdout.decode("utf-8", "replace"),
+                    proc.stderr.decode("utf-8", "replace"),
+                    proc.returncode,
+                    command=f"osd_exit {brut}",
+                )
+                self.assertEqual(
+                    proc.returncode, transporte,
+                    "le code processus doit eviter 5 et 255 sous Ansible",
+                )
+                self.assertEqual(
+                    resultat.rc, brut,
+                    "le bloc doit porter le code reel, quelle que soit la "
+                    "valeur transportee",
+                )
+
 # --------------------------------------------------------------------------
 # Arguments incomplets
 # --------------------------------------------------------------------------

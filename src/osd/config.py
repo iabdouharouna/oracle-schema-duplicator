@@ -105,6 +105,12 @@ def _schema() -> Dict[str, Spec]:
         "SOURCE_WALLET": Spec("str", "", doc="Chemin du wallet; jamais de mot de passe."),
         "SOURCE_USER": Spec("str", "", doc="Utilisateur applicatif."),
         "SOURCE_SYSDBA": Spec("bool", False, doc="Connexion source en SYSDBA."),
+        "SOURCE_OS_AUTH": Spec(
+            "bool", False,
+            doc="Authentification OS : connexion locale par l'identite du "
+                "compte d'exploitation (`/`). Incompatible avec "
+                "SOURCE_CONNECT et SOURCE_WALLET.",
+        ),
         "SOURCE_TNS_ADMIN": Spec("str", "", doc="TNS_ADMIN distant si alias TNS."),
         # -- Cible --------------------------------------------------------
         "TARGET_CONNECT": Spec("str", ""),
@@ -114,6 +120,12 @@ def _schema() -> Dict[str, Spec]:
         "TARGET_USER": Spec("str", ""),
         "TARGET_TNS_ADMIN": Spec("str", ""),
         "TARGET_SYSDBA": Spec("bool", False, doc="Connexion cible en SYSDBA."),
+        "TARGET_OS_AUTH": Spec(
+            "bool", False,
+            doc="Authentification OS : connexion locale par l'identite du "
+                "compte d'exploitation (`/`). Incompatible avec "
+                "TARGET_CONNECT et TARGET_WALLET.",
+        ),
         # -- Execution distante ------------------------------------------
         # `*_HOST` vide => execution locale (le serveur de saut heberge la
         # base). Renseigne => execution par **Ansible** sur l'hote Oracle,
@@ -503,10 +515,32 @@ def validate(cfg: Config, *, warnings: Optional[List[str]] = None) -> None:
     # -- Coherence source / cible ---------------------------------------
     src = validate_identifier(values.get("SOURCE_SCHEMA", ""), "SOURCE_SCHEMA")
     tgt = validate_identifier(values.get("TARGET_SCHEMA", ""), "TARGET_SCHEMA")
-    if not values.get("SOURCE_CONNECT"):
-        raise ConfigError("SOURCE_CONNECT absent")
-    if not values.get("TARGET_CONNECT"):
-        raise ConfigError("TARGET_CONNECT absent")
+    # `OS_AUTH` dispense de `CONNECT`, et l'exclut. Mesure sur les hotes :
+    # `/ as sysdba` repond, `/@alias as sysdba` est refuse en ORA-01017.
+    # L'authentification OS est resolue par le **systeme**, sur la machine
+    # ou s'execute le client : une chaine (base distante) ou un wallet
+    # (identite externe) sont donc deux formes de connexion contradictoires
+    # avec elle, et une combinaison ne peut aboutir qu'a un ORA-01017
+    # refuse apres coup, a l'etape qui ne le lit que comme
+    # « authentification ».
+    for prefix in ("SOURCE", "TARGET"):
+        connexion = f"{prefix}_CONNECT"
+        os_auth = bool(values.get(f"{prefix}_OS_AUTH"))
+        if os_auth:
+            for cle in (connexion, f"{prefix}_WALLET"):
+                if values.get(cle):
+                    raise ConfigError(
+                        f"{prefix}_OS_AUTH=true est incompatible avec {cle}",
+                        hint=f"{cle} designe une base distante ou un "
+                             f"wallet, alors que l'authentification OS est "
+                             f"locale : elle passe par `/`, l'identite "
+                             f"du compte d'exploitation. Retirer {cle}, "
+                             f"ou poser {prefix}_OS_AUTH=false et "
+                             f"renseigner {connexion} (et {prefix}_WALLET "
+                             "si besoin).",
+                    )
+        elif not values.get(connexion):
+            raise ConfigError(f"{connexion} absent")
     if not values.get("SOURCE_DIRECTORY"):
         raise ConfigError("SOURCE_DIRECTORY absent")
     if not values.get("TARGET_DIRECTORY"):

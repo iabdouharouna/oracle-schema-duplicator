@@ -162,6 +162,7 @@ def _copie_simulee(
     cible: "RunnerFaux | Sequence[RunnerFaux]",
     echecs: Sequence[str] = (),
     silencieux: bool = False,
+    local: Optional[Dict[str, bytes]] = None,
 ):
     """Fausse commande de transfert, qui copie entre deuxAeroportiers.
 
@@ -176,8 +177,15 @@ def _copie_simulee(
       protection est la verification de presence apres copie ;
     * defaut — la copie deplace reellement le fichier, si et seulement
       si la source le detient.
-    """
 
+    Une extremite **sans `:`** est le depot local du serveur de saut :
+    c'est le temporiseur du transfert en deux sauts. Son contenu est
+    note dans `local` (consultable par le test) **et** ecrit sur disque,
+    parce que le code reel supprime ce fichier dans un `finally` et
+    qu'un depot purement memoire rendrait cette suppression invisible.
+    """
+    if local is None:
+        local = {}
     cibles = [cible] if isinstance(cible, RunnerFaux) else list(cible)
 
     def _run(cmd: Sequence[str], **kw: Any) -> subprocess.CompletedProcess:
@@ -198,14 +206,34 @@ def _copie_simulee(
         # Un `split(":", 1)[-1]` aurait rendu `src.exemple` — le nom
         # d'hote — et le registre source n'aurait jamais trouve le
         # fichier, pour une raison qui n'a rien a voir avec ce qu'on teste.
-        _hote_partie, _, chemin_source = spec_source.rpartition(":")
-        donnees = source.fichiers.get(_cle(chemin_source))
+        if ":" in spec_source:
+            _hote_partie, _, chemin_source = spec_source.rpartition(":")
+            donnees = source.fichiers.get(_cle(chemin_source))
+        else:
+            # Extremite locale : registre d'abord, disque ensuite, pour
+            # que le depot fonctionne meme apres rechargement du test.
+            donnees = local.get(_cle(spec_source))
+            if donnees is None:
+                fichier = Path(_cle(spec_source))
+                if fichier.is_file():
+                    donnees = fichier.read_bytes()
         if donnees is None:
             return subprocess.CompletedProcess(
                 cmd, 1, b"", b"scp: No such file or directory"
             )
         if silencieux:
             return subprocess.CompletedProcess(cmd, 0, b"copie silencieuse", b"")
+        if ":" not in chemin_cible:
+            # Depot local : ni le registre source ni celui de la cible
+            # n'a de mot a dire sur un fichier qui n'est encore le leur.
+            local[_cle(chemin_cible)] = donnees
+            try:
+                cible_locale = Path(_cle(chemin_cible))
+                cible_locale.parent.mkdir(parents=True, exist_ok=True)
+                cible_locale.write_bytes(donnees)
+            except OSError:  # chemin refuse : le test ne tient pas au disque
+                pass
+            return subprocess.CompletedProcess(cmd, 0, b"copie reussie", b"")
         # La destination porte un nom d'hote : `tgt.exemple:/dst/f.dmp`.
         # Il faut donc l'**isoler** avant d'extraire le chemin, sinon la
         # cle du registre serait `/tgt.exemple/dst/f.dmp` et aucun aiguillage
@@ -281,9 +309,31 @@ class SansReseau:
     rien. Le `finally` rend l'oubli impossible.
     """
 
-    def __init__(self, source: RunnerFaux, cible: Any, **kw: Any) -> None:
+    def __init__(
+        self,
+        source: RunnerFaux,
+        cible: Any,
+        *,
+        vues: Optional[List[List[str]]] = None,
+        **kw: Any,
+    ) -> None:
         self._avant = tr._run_command
-        self._faux = _copie_simulee(source, cible, **kw)
+        faux = _copie_simulee(source, cible, **kw)
+        if vues is None:
+            self._faux = faux
+        else:
+            # Enregistrement **avant** simulation : le test lit les
+            # commandes meme quand elles echouent, et c'est meme alors
+            # qu'il doit le plus en lire — une commande qui n'a pas ete
+            # emise est aussi un constat, et un constat qu'aucun message
+            # d'erreur ne porte.
+            def _capture(
+                cmd: Sequence[str], **opts: Any
+            ) -> subprocess.CompletedProcess:
+                vues.append(list(cmd))
+                return faux(cmd, **opts)
+
+            self._faux = _capture
         self.source = source
         self.cible = cible
 
@@ -757,7 +807,11 @@ class TestLignesDeCommande(unittest.TestCase):
             self.assertIn("TRANSFER_MODE", str(erreur.hint))
             return
         self.assertIn("-O", argv)
-        self.assertEqual(argv[1], "-O", argv)
+        # L'ordre **relatif** compte, pas un indice fixe : `-3` precede
+        # `-O` quand les deux sont presents, et le test doit passer sur
+        # les deux machines. Ce qui tromperait, c'est `-O` apres une
+        # paire `-o` : `scp` le prendrait pour la valeur de l'option.
+        self.assertLess(argv.index("-O"), argv.index("-o"))
 
     def test_batchmode_est_toujours_ajoute(self):
         """Sans lui, l'echec d'authentification ouvre une invite.
@@ -1237,6 +1291,229 @@ class TestTransfertReelSurFauxHotes(unittest.TestCase):
         detail = " ".join(contexte.exception.detail)
         self.assertIn("absent", detail)
         self.assertIn("scp", detail.lower() + " ".join(contexte.exception.detail))
+
+
+class TestTransfertEnDeuxSauts(unittest.TestCase):
+    """Le transfert par mot de passe : deux invocations, jamais une.
+
+    Mesure sur l'hote de saut : `scp -3` sous `sshpass` rend un rc 5 et
+    un stderr vide — la seconde invite, trouvee dans le meme
+    processus, est prise pour la preuve que le premier essai a ete
+    refuse. Le remede n'est pas un autre client : deux commandes, une
+    invitation chacune, et un depot local entre les deux.
+
+    Le depot est **ecrit sur disque** par la fausse copie, parce que le
+    code reel le supprime dans un `finally` : une suppression que rien
+    n'a ecrite ne se voit pas, donc ne se teste pas.
+    """
+
+    def setUp(self) -> None:
+        self.source = RunnerFaux(label="source", host="src.exemple", user="oracle")
+        self.cible = RunnerFaux(label="cible", host="tgt.exemple", user="admin")
+        self.source.fichiers["/reel/base.dmp"] = b"x" * 4096
+        self.registre: Dict[str, bytes] = {}
+        dossier = tempfile.TemporaryDirectory()
+        self.addCleanup(dossier.cleanup)
+        self.cache = Path(dossier.name) / "probes"
+        self.be = backend(
+            source=self.source, target=self.cible, mode="scp",
+            cache=self.cache, ssh_password="secret",
+        )
+        self.vues: List[List[str]] = []
+
+    def _sans_reseau(self, **kw: Any) -> SansReseau:
+        """Sans reseau, en notant chaque commande emise."""
+        return SansReseau(
+            self.source, self.cible, vues=self.vues, local=self.registre, **kw
+        )
+
+    def test_le_secret_impose_deux_commandes_d_un_seul_hote_distant(self):
+        """Une commande = une invitation. Le depot relie les deux.
+
+        Chaque commande ne designe qu'un hote : `sshpass` y repond une
+        fois. `-3` disparait parce qu'il tiendrait justement les deux
+        invitations dans un meme processus — c'est precisement ce que
+        `sshpass` ne sait pas faire.
+        """
+        self.assertTrue(self.be._staging_requis("scp"))
+        with self._sans_reseau():
+            ok = self.be._run_backend(
+                "scp", "/reel", "/reprise", "base.dmp", probe=False
+            )
+        self.assertTrue(ok, self.be._last_reason)
+        self.assertEqual(len(self.vues), 2, self.vues)
+        descendre, monter = self.vues
+        for commande in self.vues:
+            self.assertEqual(commande[:3], ["sshpass", "-e", "scp"], commande)
+            self.assertNotIn("-3", commande)
+            self.assertIn("BatchMode=no", commande)
+            self.assertIn("NumberOfPasswordPrompts=1", commande)
+        # Un seul hote distant par invitation.
+        self.assertEqual(descendre[-2], "oracle@src.exemple:/reel/base.dmp")
+        self.assertNotIn("tgt.exemple", " ".join(descendre))
+        self.assertNotIn("src.exemple", " ".join(monter))
+        self.assertEqual(monter[-1], "admin@tgt.exemple:/reprise/base.dmp")
+        # Le depot est le pont : le meme chemin, dans les deux commandes.
+        depot = descendre[-1]
+        self.assertEqual(monter[-2], depot)
+        self.assertTrue(Path(depot).is_absolute())
+        # Et le fichier arrive.
+        self.assertEqual(self.cible.fichiers["/reprise/base.dmp"], b"x" * 4096)
+
+    def test_un_transfert_par_cle_reste_en_une_seule_commande(self):
+        """Pas de secret, pas de depot : `-3` tient toujours.
+
+        La bifurcation porte sur le secret, et sur lui seul : sans
+        invitation a repondre, la temporisation serait un cout paye pour
+        rien, et un `-3` rendu absent romprait le transfert direct qui,
+        lui, fonctionne.
+        """
+        sans_secret = backend(
+            source=self.source, target=self.cible, mode="scp", cache=self.cache
+        )
+        self.assertFalse(sans_secret._staging_requis("scp"))
+        self.assertTrue(self.be._staging_requis("scp"))
+
+    def test_le_depot_ne_survit_pas_a_la_remontee(self):
+        """Le dump ne doit pas rester sur le serveur de saut.
+
+        Un depot oublie, c'est un dump visible de tous les comptes du
+        serveur de saut, qui s'accumule d'un run a l'autre sans que
+        rien ne le signale — et le dump contient les donnees du schema.
+        """
+        with self._sans_reseau():
+            ok = self.be._run_backend(
+                "scp", "/reel", "/reprise", "base.dmp", probe=False
+            )
+        self.assertTrue(ok, self.be._last_reason)
+        depot = Path(self.vues[0][-1])
+        self.assertFalse(depot.exists(), "le depot subsiste apres la copie")
+        staging = self.cache.parent / "staging"
+        self.assertEqual(list(staging.iterdir()), [])
+
+    def test_un_echec_de_la_remontee_supprime_egalement_le_depot(self):
+        """La seconde commande echoue : le depot part quand meme.
+
+        C'est le cas ou l'oubli serait le plus probable — un `finally`
+        execute alors que la variable d'etat de l'etape annonce un
+        echec, et que l'envie de « laisser voir » est reelle pour le
+        diagnostic. La regle est pourtant la meme dans les deux cas :
+        rien ne reste sur le serveur de saut.
+        """
+        with self._sans_reseau(
+            echecs=("admin@tgt.exemple:/reprise/base.dmp",)
+        ):
+            ok = self.be._run_backend(
+                "scp", "/reel", "/reprise", "base.dmp", probe=False
+            )
+        self.assertFalse(ok)
+        # Les deux invitations ont ete faites : c'est la seconde qui
+        # echoue, et la premiere ne doit pas pour autant laisser un
+        # depot derriere elle.
+        self.assertEqual(len(self.vues), 2)
+        self.assertIn("sous-systeme", self.be._last_reason)
+        self.assertFalse(Path(self.vues[0][-1]).exists())
+        self.assertNotIn("/reprise/base.dmp", self.cible.fichiers)
+
+    def test_l_absence_de_place_est_dite_avant_la_premiere_copie(self):
+        """Le controle est anterieur a toute copie.
+
+        Sans lui, l'echec surviendrait a mi-parcours, signale par un
+        message du systeme de fichiers qui ne nomme ni le fichier ni la
+        topologie, et apres avoir occupe le double de la place
+        necessaire. Le message dit ici la taille, la place et le
+        repertoire — les trois element d'un defaut disque, dont aucun ne
+        figure dans « No space left on device ».
+        """
+        with mock.patch(
+            "shutil.disk_usage", return_value=mock.Mock(free=0, total=0, used=0)
+        ):
+            with self._sans_reseau():
+                ok = self.be._run_backend(
+                    "scp", "/reel", "/reprise", "base.dmp", probe=False
+                )
+        self.assertFalse(ok)
+        self.assertEqual(self.vues, [], "une copie a ete tentee sans place")
+        self.assertIn("place insuffisante", self.be._last_reason)
+        self.assertIn("base.dmp", self.be._last_reason)
+        self.assertIn("libres", self.be._last_reason)
+
+    def test_rsync_en_deux_sauts_ne_designe_qu_un_hote_a_fois(self):
+        """Le meme principe, pour le seul backend resumable.
+
+        `rsync` fait passer le distant-a-distant par la machine qui le
+        lance — deux sessions, donc deux invitations. Le depot est le
+        meme que pour `scp` : c'est le mode d'authentification qui
+        impose la forme, pas le client.
+        """
+        be = backend(
+            source=self.source, target=self.cible, mode="rsync",
+            cache=self.cache, ssh_password="secret",
+        )
+        with self._sans_reseau():
+            ok = be._run_backend(
+                "rsync", "/reel", "/reprise", "base.dmp", probe=False
+            )
+        self.assertTrue(ok, be._last_reason)
+        self.assertEqual(len(self.vues), 2, self.vues)
+        for commande in self.vues:
+            self.assertEqual(commande[:3], ["sshpass", "-e", "rsync"], commande)
+            # Le `-e` de `sshpass` est retranche : il ne porte pas les
+            # options SSH, et les compterait deux fois.
+            self.assertEqual(commande[3:].count("-e"), 1, commande)
+            distants = [a for a in commande if "@" in a and ":" in a]
+            self.assertEqual(len(distants), 1, commande)
+        self.assertEqual(self.vues[0][-1], self.vues[1][-2])
+        self.assertEqual(self.cible.fichiers["/reprise/base.dmp"], b"x" * 4096)
+
+    def test_le_dry_run_ne_cree_meme_pas_le_depot(self):
+        """La retenue precede le depot : un run simule ne laisse rien.
+
+        Le depot est un effet de bord sur le serveur de saut. Un
+        `--dry-run` qui en creerait un serait la seule trace d'une
+        execution qui n'a rien fait — une trace qui, elle, s'accumule.
+        """
+        source = RunnerFaux(label="source", allows_mutation=False)
+        be = backend(
+            source=source, target=self.cible, mode="scp",
+            cache=self.cache, ssh_password="secret",
+        )
+        with self._sans_reseau():
+            self.assertFalse(
+                be._run_backend("scp", "/reel", "/reprise", "base.dmp", probe=False)
+            )
+        self.assertEqual(self.vues, [])
+        self.assertIn("dry-run", be._last_reason)
+        self.assertFalse(
+            (self.cache.parent / "staging").exists(),
+            "le dry-run a cree le depot",
+        )
+
+    def test_le_transfert_complet_par_mot_de_passe_arrive_sans_residu(self):
+        """Bout en bout : sonde et dump passent par le depot tous deux.
+
+        La sonde ne doit pas valider un mecanisme different de celui du
+        dump — sinon elle reussirait la ou le transfert echouerait, ce
+        qui est le pire des diagnostics. Elle suit donc exactement le
+        meme chemin : deux invitations par copie.
+        """
+        with self._sans_reseau():
+            outcome = self.be.run(
+                src_dir="/reel", dst_dir="/reprise",
+                names=["base.dmp"], job_name="J",
+            )
+        self.assertEqual(outcome.files, ["base.dmp"])
+        self.assertEqual(outcome.bytes_total, 4096)
+        self.assertEqual(outcome.method, "relais")
+        self.assertEqual(self.cible.fichiers["/reprise/base.dmp"], b"x" * 4096)
+        dump = [c for c in self.vues if "base.dmp" in " ".join(c)]
+        temoin = [c for c in self.vues if ".osd-probe-" in " ".join(c)]
+        self.assertEqual(len(dump), 2, self.vues)
+        self.assertEqual(len(temoin), 2, self.vues)
+        staging = self.cache.parent / "staging"
+        self.assertEqual(
+            list(staging.iterdir()), [], "residu dans le depot apres le run"
+        )
 
 
 class TestClassificationDesErreurs(unittest.TestCase):

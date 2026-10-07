@@ -306,6 +306,79 @@ class TestGardeFous(unittest.TestCase):
                     support.load_config(SOURCE_SCHEMA=nom)
 
 
+class TestAuthentificationOS(unittest.TestCase):
+    """`*_OS_AUTH` : la connexion par identite du systeme.
+
+    Mesure sur les hotes : `/ as sysdba` repond, `/@alias as sysdba`
+    est refuse en ORA-01017. L'authentification OS est **locale** — elle
+    passe par `/`, pas par une chaine — et exclusive : `CONNECT` et
+    `WALLET` sont deux formes de connexion qui la contredisent, et la
+    combinaison echouerait apres coup, a une etape qui ne lit qu'un
+    « ORA-01017 » sans lien avec la cause.
+    """
+
+    def test_os_auth_dispense_de_connect(self):
+        """`/` remplace la chaine : la configuration est valide sans elle."""
+        cfg = support.load_config(
+            SOURCE_CONNECT="", TARGET_CONNECT="",
+            SOURCE_OS_AUTH="true", TARGET_OS_AUTH="true",
+        )
+        self.assertTrue(cfg.get("SOURCE_OS_AUTH"))
+        self.assertTrue(cfg.get("TARGET_OS_AUTH"))
+
+    def test_les_deux_formes_coexistent_cote_a_cote(self):
+        """`SOURCE` en OS ne change rien a la regle du `TARGET`.
+
+        La validation compose par cote, elle n'imite pas : `SOURCE` peut
+        etre en authentification OS pendant que `TARGET` reste regle par
+        `CONNECT`, et l'inverse aussi.
+        """
+        cfg = support.load_config(SOURCE_CONNECT="", SOURCE_OS_AUTH="true")
+        self.assertTrue(cfg.get("SOURCE_OS_AUTH"))
+        self.assertEqual(cfg.get("SOURCE_CONNECT"), "")
+        self.assertEqual(cfg.get("TARGET_CONNECT"), "L_TGT")
+        self.assertFalse(cfg.get("TARGET_OS_AUTH"))
+        self.assertFalse(cfg.get("SOURCE_WALLET"))
+
+    def test_os_auth_refuse_une_chaine_connexion(self):
+        """Chaine + OS : deux identites pour une connexion.
+
+        Renseigner `SOURCE_CONNECT` avec `SOURCE_OS_AUTH=true` menait a
+        un `ORA-01017` mesure — la chaine est ignoree par le client en
+        mode OS, mais l'exploitant la croit active. Refuser nomme le
+        conflit avant le run, la ou le rapport peut le porter.
+        """
+        with self.assertRaises(ConfigError) as ctx:
+            support.load_config(SOURCE_OS_AUTH="true")
+        message = str(ctx.exception)
+        self.assertIn("SOURCE_OS_AUTH=true est incompatible", message)
+        self.assertIn("SOURCE_CONNECT", message)
+        self.assertIn("locale", ctx.exception.hint)
+
+    def test_os_auth_refuse_un_wallet(self):
+        """Le wallet est une identite externe : elle contredit `/`."""
+        with self.assertRaises(ConfigError) as ctx:
+            support.load_config(
+                SOURCE_CONNECT="", SOURCE_OS_AUTH="true",
+                SOURCE_WALLET="/opt/oracle/wallet",
+            )
+        self.assertIn("SOURCE_WALLET", str(ctx.exception))
+
+    def test_la_dispense_joue_aussi_cote_cible(self):
+        """La symetrie est une regle, pas un defaut du copier-coller."""
+        cfg = support.load_config(
+            TARGET_CONNECT="", TARGET_OS_AUTH="true",
+        )
+        self.assertTrue(cfg.get("TARGET_OS_AUTH"))
+        self.assertEqual(cfg.get("SOURCE_CONNECT"), "L_SRC")
+
+    def test_sans_os_auth_connect_reste_obligatoire(self):
+        """La dispense est liee a l'option, pas a l'humeur du fichier."""
+        with self.assertRaises(ConfigError) as ctx:
+            support.load_config(SOURCE_CONNECT="")
+        self.assertIn("SOURCE_CONNECT absent", str(ctx.exception))
+
+
 class TestClesObsoletes(unittest.TestCase):
     """Une option acceptee et ignoree est pire qu'une option refusee.
 
@@ -553,7 +626,8 @@ class TestFichierExemple(unittest.TestCase):
         # deux obsoletes d'origine, et les six cles SSH retirees. Les
         # garder actives donnerait au recopieur une configuration qui
         # echoue a la lecture, ce qui est le pire des deux mondes.
-        tolerees = {"STAGING_DIR", "REMOTE_TRANSFER"} | set(cfg_mod._OBSOLETE_SSH_KEYS)
+        tolerees = {"STAGING_DIR", "REMOTE_TRANSFER",
+                    "SOURCE_OS_AUTH", "TARGET_OS_AUTH"} | set(cfg_mod._OBSOLETE_SSH_KEYS)
         manquantes = set(cfg_mod.schema_keys()) - set(raw)
         self.assertLessEqual(manquantes, tolerees)
         # Chacune doit quand meme etre nommee dans le gabarit : une

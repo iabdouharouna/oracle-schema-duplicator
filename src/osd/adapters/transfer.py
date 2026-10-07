@@ -4,14 +4,15 @@ Le dump n'est visible que de l'hote ou tourne `expdp` : le chemin
 `DIRECTORY` n'est pas atteignable depuis le serveur de saut. Trois
 topologies sont donc possibles, et le choix n'est pas neutre :
 
-* **local** — les deux bases sont sur le meme serveur de fichiers, ou le
-  dump est ecrit dans un DIRECTORY partage. Aucun transfert reseau.
-* **relais** (defaut) — le dump descend sur le serveur de saut, puis
-  remonte vers la cible. Simple, mais le dump transite en deux fois et le
-  serveur de saut doit disposer de la place correspondante.
-* **direct** — le dump va directement de l'hote source a l'hote cible, le
-  serveur de saut n'etant qu'un orchestrateur. C'est la seule option
-  viable quand le dump depasse la place disponible sur le saut.
+* **partage** — les deux bases voient le meme systeme de fichiers : aucun
+  transfert reseau, le dump reste ou `expdp` l'a ecrit.
+* **relais** — les deux cotes sont distantes, et le dump passe par le
+  serveur de saut. Deux formes selon le mode d'authentification, cf.
+  `_staging_requis` : `scp -3` par cle, deux sauts separes par mot de
+  passe — au prix d'une temporisation sur le serveur de saut, qui doit
+  en disposer de la place.
+* **mixte** — un cote local et un cote distant : refuse. `_topologie` le
+  nomme pour le designer dans le refus, pas pour l'ignorer.
 
 Le choix du mecanisme (`rsync`, `scp`, `sftp`, `scp` en mode heritage) est
 determine par **sonde de capacite reelle**, jamais par la presence d'un
@@ -20,20 +21,26 @@ sous-systeme `sftp` peut etre absent du `sshd` de l'AIX, et seule une
 copie reelle le revele. C'est le cas le plus courant sur AIX, ou le
 `sshd` est ancien.
 
-Aucun mot de passe n'est utilise : le transfert repose sur une cle SSH,
-avec `BatchMode=yes` pour qu'une erreur d'authentification echoue au
-lieu de bloquer sur une invite.
+Deux modes d'authentification coexistent. **Par cle**, la commande porte
+`BatchMode=yes` : une erreur d'authentification echoue au lieu de
+bloquer sur une invite, sous cron, jusqu'a expiration du crontab. **Par
+mot de passe** — le secret de l'inventaire, lu aupres du runner —
+`BatchMode` vaut `no`, `NumberOfPasswordPrompts=1` borne la tentative, et
+le secret est remis a `sshpass` par l'environnement, jamais par argument :
+`ps` ne le montrerait nulle part.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..errors import TransferError
 from ..logging_setup import get_logger
@@ -489,47 +496,246 @@ class TransferBackend:
         # rapport, ou une repetition signe une double responsabilite.
         ssh_opts = _opts_du_runner(self.source)
 
-        if backend == "rsync":
-            cmd = self._rsync_command(src_dir, dst_dir, name, ssh_opts)
-        elif backend in ("scp", "scp-legacy"):
-            cmd = self._scp_command(src_dir, dst_dir, name, ssh_opts, legacy=backend == "scp-legacy")
-        elif backend == "sftp":
+        if backend == "sftp":
             ok, reason = self._sftp_command(src_dir, dst_dir, name, ssh_opts)
             if not ok:
                 self._last_reason = reason
                 return False
             return True
+
+        if self._staging_requis(backend):
+            # Deux invocations plutot qu'une : c'est la seule facon de
+            # faire repondre `sshpass` deux fois.
+            return self._run_staged(backend, src_dir, dst_dir, name, ssh_opts, probe=probe)
+
+        if backend == "rsync":
+            commandes = [self._rsync_command(src_dir, dst_dir, name, ssh_opts)]
+        elif backend in ("scp", "scp-legacy"):
+            commandes = [
+                self._scp_command(
+                    src_dir, dst_dir, name, ssh_opts, legacy=backend == "scp-legacy"
+                )
+            ]
         else:  # pragma: no cover - garde-fou
             self._last_reason = f"backend inconnu: {backend}"
             return False
+        return self._execute(backend, commandes, probe=probe)
 
-        # L'enveloppe est posee ici, une fois pour tous les backends :
-        # `rsync`, `scp` et `sftp` appellent tous `ssh` en sous-processus,
-        # et c'est ce sous-processus, lui, qui a besoin du mot de passe.
-        cmd = _prefixe_sshpass(self.ssh_password) + cmd
-        try:
-            proc = _run_command(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=_PROBE_TIMEOUT if probe else None,
-                check=False,
-                env=_env_avec_mot_de_passe(self.ssh_password),
-            )
-        except FileNotFoundError:
-            self._last_reason = f"client {backend} absent du serveur de saut"
-            return False
-        except subprocess.TimeoutExpired:
-            self._last_reason = "delai depasse"
-            return False
-        except OSError as exc:  # pragma: no cover
-            self._last_reason = exc.strerror or "erreur systeme"
-            return False
+    def _execute(
+        self, backend: str, commandes: Sequence[Sequence[str]], *, probe: bool
+    ) -> bool:
+        """Enveloppe `sshpass` et execution, jusqu'au premier echec.
 
-        if proc.returncode != 0:
-            self._last_reason = _classify_error(proc.stderr)
-            return False
+        L'enveloppe est posee ici, une fois pour tous les backends :
+        `rsync` et `scp` appellent `ssh` en sous-processus, et c'est ce
+        sous-processus, lui, qui a besoin du mot de passe.
+
+        Chaque commande est enveloppee **separement**. `sshpass` ne sait
+        repondre qu'a une seule invite par invocation — la seconde est
+        prise pour un mauvais mot de passe, et il termine sur un rc 5
+        sans un mot de message (mesure sur `scp -3`, cf.
+        `_staging_requis`). Une liste de deux commandes est donc la
+        forme normale du transfert par mot de passe, et une liste d'une
+        seule celle du transfert par cle.
+        """
+        for commande in commandes:
+            argv = _prefixe_sshpass(self.ssh_password) + list(commande)
+            try:
+                proc = _run_command(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=_PROBE_TIMEOUT if probe else None,
+                    check=False,
+                    env=_env_avec_mot_de_passe(self.ssh_password),
+                )
+            except FileNotFoundError:
+                self._last_reason = f"client {backend} absent du serveur de saut"
+                return False
+            except subprocess.TimeoutExpired:
+                self._last_reason = "delai depasse"
+                return False
+            except OSError as exc:  # pragma: no cover
+                self._last_reason = exc.strerror or "erreur systeme"
+                return False
+
+            if proc.returncode != 0:
+                self._last_reason = _classify_error(proc.stderr)
+                return False
         return True
+
+    # -- Transfert en deux sauts (mot de passe) ---------------------------
+    def _staging_requis(self, backend: str) -> bool:
+        """Deux sauts separes, avec temporisation sur le serveur de saut.
+
+        `scp -3` — et le `distant-a-distant` de `rsync` — ouvre **deux**
+        sessions `ssh` dans un seul processus. En authentification par
+        cle, les deux repondent silencieusement et une commande suffit.
+
+        Par mot de passe, une seule des deux invitations trouve une
+        reponse : `sshpass` voit une seconde invite, la prend pour la
+        preuve que le premier essai a ete refuse, et termine (rc 5,
+        stderr vide). C'est mesure, pas suppose — et le remede n'est pas
+        de changer de client : un secret par invocation, donc deux
+        invocations.
+
+        La condition est donc le secret lui-meme. La topologie aussi :
+        en `partage` il n'y a rien a copier, et `_run_backend` n'est de
+        toute facon jamais atteint.
+        """
+        if not self.ssh_password:
+            return False
+        if self._topologie() != RELAIS:
+            return False
+        return backend in ("scp", "scp-legacy", "rsync")
+
+    def _staging_root(self) -> Path:
+        """Repertoire local ou le dump est temporise entre les deux sauts.
+
+        `WORK_DIR/probes` designe `WORK_DIR` : ce repertoire est deja
+        impose **local** (jamais NFS, cf. la configuration), cree et
+        permis au debut du run. C'est donc le seul endroit du serveur de
+        saut dont la place soit d'une lecture immediate.
+
+        Sans cache — un usage isole de la classe — on retombe sur le
+        repertoire temporaire du systeme : la seule autre certitude, et
+        un endroit ou un depot ephemere est la norme plutot que l'exception.
+        """
+        if self.cache_dir is not None:
+            racine = self.cache_dir.parent / "staging"
+        else:
+            racine = Path(tempfile.gettempdir()) / "osd-staging"
+        try:
+            racine.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise TransferError(
+                "repertoire de temporisation inutilisable sur le serveur de saut",
+                detail=[f"{racine}: {exc.strerror or exc}"],
+                hint="Le transfert par mot de passe fait passer le dump par "
+                     "ce repertoire entre les deux sauts. En corriger les "
+                     "droits, ou poser une cle SSH pour revenir au "
+                     "transfert direct (scp -3).",
+            )
+        return racine
+
+    @staticmethod
+    def _staging_path(racine: Path, name: str) -> Path:
+        """Nom de temporisation : deux runs ne peuvent pas se croiser.
+
+        Le verrou de run empeche deux executions simultanees de l'outil,
+        mais rien n'empeche un echec brutal d'en laisser un apres soi,
+        ni un operateur de lancer deux instances depuis deux terminaux.
+        Le pid et l'horloge au milliseconde rendent le croisement
+        impossible, et le prefixe `.osd-stage-` rend le residu
+        identifiable d'un simple `ls` — un dump n'a jamais ce nom.
+        """
+        return racine / (
+            f".osd-stage-{os.getpid()}-{time.time_ns()}-{PurePosixPath(name).name}"
+        )
+
+    def _place_suffisante(self, racine: Path, src_dir: str, name: str) -> bool:
+        """Le dump temporise t-il dans la place du serveur de saut ?
+
+        Le controle est anterieur a la premiere copie. Sans lui, l'echec
+        surviendrait a mi-parcours, signale par un message du systeme de
+        fichiers qui ne nomme ni le fichier ni la topologie, et apres
+        avoir occupe le double de la place necessaire.
+
+        Un `OSError` de `disk_usage` ne bloque pas : mieux vaut laisser
+        `scp` constater lui-meme, avec son propre message, que de
+        refuser un transfert que le systeme aurait peut-etre pu accueillir.
+        """
+        taille = _stat_remote(self.source, src_dir, name)
+        try:
+            libre = shutil.disk_usage(str(racine)).free
+        except OSError:  # pragma: no cover - systeme exotique
+            return True
+        if taille <= libre:
+            return True
+        self._last_reason = (
+            f"place insuffisante sur le serveur de saut pour temporiser {name} "
+            f"({human_bytes(taille)} requis, {human_bytes(libre)} libres "
+            f"dans {racine})"
+        )
+        return False
+
+    def _staged_commands(
+        self,
+        backend: str,
+        src_dir: str,
+        dst_dir: str,
+        name: str,
+        ssh_opts: Sequence[str],
+        local: Path,
+    ) -> Tuple[List[str], List[str]]:
+        """Les deux commandes : descendre sur le saut, puis remonter.
+
+        Chaque commande n'a qu'un hote distant, donc qu'une invitation,
+        donc qu'une reponse de `sshpass`. Le `-3` disparait — il n'y a
+        plus deux sauts a faire passer par un meme processus — et
+        `local` tient la place du second hote dans les deux cas.
+        """
+        descendre = f"{_hote(self.source)}:{PurePosixPath(src_dir) / name}"
+        monter = _cible(self.target, dst_dir, name)
+        if backend == "rsync":
+            argv = ["rsync", "-a", "--partial", "--timeout=120"]
+            ssh = self._rsync_e(ssh_opts)
+            if ssh:
+                argv.extend(["-e", ssh])
+            return argv + [descendre, str(local)], argv + [str(local), monter]
+        legacy = backend == "scp-legacy"
+        return (
+            self._scp_argv(ssh_opts, legacy, [descendre, str(local)], trois=False),
+            self._scp_argv(ssh_opts, legacy, [str(local), monter], trois=False),
+        )
+
+    def _run_staged(
+        self, backend: str, src_dir: str, dst_dir: str, name: str,
+        ssh_opts: Sequence[str], *, probe: bool,
+    ) -> bool:
+        """Transfert en deux sauts, avec temporisation sur le saut.
+
+        Le fichier est retire dans un `finally` : que la seconde copie
+        reussisse, echoue, ou soit interrompue, le serveur de saut n'a
+        rien a conserver. Seul un SIGKILL — le second signal du rituel
+        d'arret — peut en laisser un apres soi, et il est alors
+        reconnaissable a son prefixe (cf. `_staging_path`).
+        """
+        racine = self._staging_root()
+        local = self._staging_path(racine, name)
+        try:
+            if not self._place_suffisante(racine, src_dir, name):
+                return False
+            descendre, monter = self._staged_commands(
+                backend, src_dir, dst_dir, name, ssh_opts, local
+            )
+            LOG.info(
+                "transfert %s en deux sauts, temporisation %s", name, local
+            )
+            if not self._execute(backend, [descendre], probe=probe):
+                return False
+            return self._execute(backend, [monter], probe=probe)
+        finally:
+            try:
+                local.unlink()
+            except OSError:
+                pass
+
+    def _rsync_e(self, ssh_opts: Sequence[str]) -> str:
+        """La valeur de `-e` pour `rsync`, ou chaine vide.
+
+        Une seule paire `-o`/valeur par option, parce que `rsync`
+        decoupe la valeur sur les espaces avant de la donner a un
+        shell : sans le `-o`, `ConnectTimeout=10` deviendrait un nom
+        d'hote a joindre, et l'echec parlerait de resolution de nom.
+        """
+        options = _merge_opts(ssh_opts, self.ssh_password)
+        if not options:
+            return ""
+        ssh = "ssh"
+        for opt in options:
+            ssh += " -o " + opt
+        return ssh
 
     def _rsync_command(
         self, src_dir: str, dst_dir: str, name: str, ssh_opts: Sequence[str]
@@ -579,14 +785,11 @@ class TransferBackend:
         # dans les options SSH, que `_merge_opts` construit a partir de
         # l'inventaire. Une sonde contre un hote injoignable echoue donc
         # en 10 s, pas en 120.
-        options = _merge_opts(ssh_opts, self.ssh_password)
-        if options:
+        ssh = self._rsync_e(ssh_opts)
+        if ssh:
             # `-o` devant chaque option, et non un seul `-o` suivi de
             # toutes : `rsync` scinde la valeur de `-e` sur les espaces
             # avant de la donner a un shell. Voir la note de version.
-            ssh = "ssh"
-            for opt in options:
-                ssh += " -o " + opt
             argv.extend(["-e", ssh])
         argv.extend([
             f"{_hote(self.source)}:{PurePosixPath(src_dir) / name}",
@@ -597,7 +800,7 @@ class TransferBackend:
     def _scp_command(
         self, src_dir: str, dst_dir: str, name: str, ssh_opts: Sequence[str], *, legacy: bool
     ) -> List[str]:
-        """Commande `scp`.
+        """Commande `scp` directe : les deux sauts dans un seul processus.
 
         **`-3` est obligatoire en topologie `relais`.** Sans lui, `scp`
         fait le second saut **depuis la source** : la source ouvre sa
@@ -612,22 +815,49 @@ class TransferBackend:
         deja les deux cles. Le transfert reste donc exactement aussi
         controle, et ne demande aucune cle distribuee entre les hotes.
 
-        L'option est posee **avant** les `-o`, comme `-O` : `scp` analyze
-        les options par ordre, et une option placee apres une paire
+        Cette forme n'est employee que **par cle** : deux sessions dans
+        un meme processus supposent deux authentifications silencieuses.
+        Par mot de passe, `_staging_requis` impose la forme en deux
+        commandes de `_staged_commands`, qui partage l'assemblage avec
+        `_scp_argv`.
+        """
+        return self._scp_argv(
+            ssh_opts,
+            legacy,
+            [
+                f"{_hote(self.source)}:{PurePosixPath(src_dir) / name}",
+                _cible(self.target, dst_dir, name),
+            ],
+            trois=True,
+        )
+
+    def _scp_argv(
+        self,
+        ssh_opts: Sequence[str],
+        legacy: bool,
+        operandes: Sequence[str],
+        *,
+        trois: bool,
+    ) -> List[str]:
+        """Assemblage commun des formes directe et en deux sauts de `scp`.
+
+        `-3` et `-O` sont poses **avant** les `-o` : `scp` analyse les
+        options par ordre, et une option placee apres une paire
         d'arguments serait prise pour un chemin.
 
         Le mode heritage (`-O`) impose l'ancien protocole `scp` distant
         au lieu du SFTP de l'OpenSSH 9. C'est le mode a utiliser sur un
         AIX dont le `sshd` ne fournit pas le sous-systeme sftp, ou le
         transfert echoue avec « Subsystem request failed » sans qu'aucun
-        journal ne dise pourquoi.
+        journal ne dise pourquoi. `-O` n'existe pas avant OpenSSH 9 : sa
+        presence est verifiee plutot que de laisser `scp` echouer sur une
+        option inconnue, dont le message ne dit pas « option
+        inexistante » mais « fichier introuvable ».
         """
-        argv = ["scp", "-3"]
+        argv = ["scp"]
+        if trois:
+            argv.append("-3")
         if legacy:
-            # `-O` n'existe pas avant OpenSSH 9 : sa presence est
-            # verifiee plutot que de laisser `scp` echouer sur une
-            # option inconnue, dont le message ne dit pas « option
-            # inexistante » mais « fichier introuvable ».
             if not _scp_supports_legacy():
                 self._last_reason = "scp local sans support du mode heritage (-O)"
                 raise TransferError(
@@ -639,10 +869,7 @@ class TransferBackend:
             argv.append("-O")
         for opt in _merge_opts(ssh_opts, self.ssh_password):
             argv.extend(["-o", opt])
-        argv.extend([
-            f"{_hote(self.source)}:{PurePosixPath(src_dir) / name}",
-            _cible(self.target, dst_dir, name),
-        ])
+        argv.extend(operandes)
         return argv
 
     def _sftp_command(

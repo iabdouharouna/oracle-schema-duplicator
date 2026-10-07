@@ -100,6 +100,13 @@ texte deviendrait alors le mot de passe remis à `sshpass`, et l'échec
 n'apparaîtrait qu'à la copie, sous la forme d'une authentification refusée
 sans lien visible avec sa cause.
 
+Ce secret alimente aussi **le transfert**, et c'est la variable
+`ansible_password` qui est lue (par `AnsibleRunner.ssh_password`), jamais la
+clé `PASSWORD` de la configuration, réservée à la connexion Oracle. En mode
+mot de passe, chaque saut du transfert est une invocation séparée, reliées
+par un dépôt local du serveur de saut — voir `ARCHITECTURE.md`,
+« Par mot de passe, chaque saut est une invocation séparée ».
+
 ## Profil de connexion
 
 Chaque script commence par sourcer le profil de l'hôte :
@@ -221,6 +228,18 @@ Le code est donc transporté **explicitement** par `osd_exit`, qui le mémorise
 avant de quitter ; le trap le restitue à `osd_finish`. Sur ksh93, `$?`
 donnerait le même résultat, mais une forme unique pour tous les shells évite
 d'avoir à savoir lequel est en service.
+
+Le code **processus**, lui, ne peut pas être transporté tel quel. Sous
+Ansible, il est lu avant que le bloc existe, et le plugin `connection/ssh`
+y attache deux sens qui lui sont propres : `5`, parce que `sshpass` renvoie
+son code propre quand il réussit, devient « mot de passe incorrect » — la
+tâche est déclarée injoignable, la sortie entière est jetée sans un mot et
+sans réessai — et `255` signifie « la connexion ssh a échoué ». Or `impdp`
+sort `5` quand le job aboutit avec des erreurs : c'est le cas normal d'un
+import `TABLE_EXISTS_ACTION=SKIP` sur un schéma déjà peuplé, où chaque objet
+non-table déjà présent est signalé `ORA-31684`. `osd_exit` dévie donc ces
+deux valeurs (`5` → `71`, `255` → `72`) ; le code réel reste dans
+`OSD_RESULT_END rc=`, seule valeur que `_parse_result` lit.
 | `sed -i` | non POSIX |
 | `cpio` | absent du `PATH` minimal |
 | **tout `eval`** | règle absolue du projet |

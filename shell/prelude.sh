@@ -276,9 +276,42 @@ osd_tmpfile() {
 # quitter, et le trap le restitue. Sur ksh93, `$?` donnerait le meme
 # resultat, mais une seule forme pour tous les shells evite d'avoir a
 # savoir lequel est en service.
+#
+# Le code **processus**, lui, n'est que du transport — et sous Ansible
+# il est lu par `sshpass`, avant meme que le bloc existe. Deux valeurs
+# y sont fatales :
+#
+# * 5 : sshpass renvoie son code propre quand il reussit lui-meme, et
+#   Ansible lit alors 5 comme « mot de passe incorrect » (`_handle_error`
+#   du plugin connection/ssh). La tache est declaree injoignable, la
+#   sortie complete est jetee sans un mot et sans retry, et l'echec se
+#   conclut sur un diagnostic muet sans rapport avec la cause. Or
+#   `impdp` sort 5 quand le job aboutit avec des erreurs — le cas
+#   normal d'un import `TABLE_EXISTS_ACTION=SKIP` sur un schema deja
+#   peuple, ou chaque objet non-table deja present est signale
+#   `ORA-31684`.
+# * 255 : le meme plugin y lit « la connexion ssh a echoue », rejoue la
+#   connexion puis echoue — un code qu'un client courant peut sortir
+#   de facon anodine.
+#
+# Ces deux valeurs sont donc deviees, vers des codes sans signification
+# dans tout le projet : 71 et 72 evitent 5 comme 255, et ne sont emis
+# par aucun autre chemin interne (`osd_die` use de 64, 65, 66, 69, 70,
+# 73 et 127). La valeur exacte n'a aucune importance : le code reel
+# reste dans `_osd_exit_code`, que le trap ecrit dans
+# `OSD_RESULT_END rc=`, substitue au code processus par
+# `_parse_result`. Le bloc, et lui seul, distingue donc un 71 arrive de
+# facon legitime d'un 5 devie — le projet ne lit jamais le code
+# processus, et la seule valeur qui change est celle qu'Ansible
+# interpretait a tort.
 _osd_exit_code=0
 osd_exit() {
+    # $1 = code de sortie du script
     _osd_exit_code="$1"
+    case "$1" in
+        5)   exit 71 ;;
+        255) exit 72 ;;
+    esac
     exit "$1"
 }
 trap 'osd_finish $_osd_exit_code' 0
