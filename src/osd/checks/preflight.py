@@ -267,24 +267,44 @@ def check_source_schema(adapter, schema: str, *, content: str) -> CheckResult:
     )
 
 
-def check_target_schema(adapter, schema: str, *, allow_existing: bool) -> CheckResult:
+def check_target_schema(
+    adapter, schema: str, *, allow_existing: bool, can_create: bool = False
+) -> CheckResult:
     """Verifie l'etat du schema cible.
 
     Un schema cible deja peuple est refuse par defaut : `SKIP` laisserait
     un melange de donnees anciennes et nouvelles, et `REPLACE` ecraserait
     des donnees sans que l'exploitant l'ait demande. C'est la raison
     d'etre de `ALLOW_EXISTING_TARGET`, et la raison du controle.
+
+    `can_create` indique que `CREATE_TARGET_SCHEMA` autorise la creation
+    du compte absent. Il ne change pas le constat, seulement le remede :
+    affirmer « l'outil ne cree pas de schema » a un exploitant qui l'a
+    autorise serait faux, et le ferait chercher une cause inexistante.
     """
     name = f"schema cible {schema}"
     if not adapter.schema_exists(schema):
+        if can_create:
+            hint = (
+                "CREATE_TARGET_SCHEMA est actif, mais le compte n'est "
+                "toujours pas visible : il n'a donc pas pu etre cree. "
+                "Consulter le journal du run, et verifier le statut du "
+                "compte."
+            )
+        else:
+            hint = (
+                "L'outil ne cree pas de schema par defaut : autoriser "
+                "explicitement CREATE_TARGET_SCHEMA=true pour le creer a "
+                "l'image du schema source, ou creer le compte cible lors "
+                "de l'initialisation de la base. Verifier le nom et le "
+                "statut du compte."
+            )
         return CheckResult(
             name=name,
             status=FAIL,
             code=ec.PREREQ,
             message=f"le schema {schema} n'existe pas",
-            hint="L'outil ne cree pas de schema : la creation du compte cible "
-                 "relève de l'initialisation de la base, pas de la "
-                 "duplication. Verifier le nom et le statut du compte.",
+            hint=hint,
         )
 
     objects = adapter.object_count(schema)

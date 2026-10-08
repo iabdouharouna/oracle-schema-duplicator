@@ -357,6 +357,60 @@ def _adaptateur_cible(
     return support.FakeAdapter(**donnees)
 
 
+#: Metadonnees du compte source, requises pour le deduire.
+_META_SOURCE = {
+    "from dba_users where username": [["USERS", "TEMP", "DEFAULT"]],
+    "select spare4 from sys.user$": [["S:B031DD;T:D80021"]],
+    "from dba_sys_privs where grantee": [["CREATE SESSION"]],
+    "from dba_role_privs where grantee": [["RESOURCE"]],
+    "from dba_ts_quotas where username": [["USERS", "-1"]],
+}
+
+#: Ce que la cible peut recevoir : le tablespace, le profil et le role.
+_META_CIBLE = {
+    "from dba_tablespaces": [["USERS"], ["TEMP"]],
+    "select distinct profile from dba_profiles": [["DEFAULT"]],
+    "select role from dba_roles": [["RESOURCE"]],
+}
+
+
+class SchemaCibleCree(support.FakeAdapter):
+    """Schema cible absent, qui apparait des que l'outil le cree.
+
+    Un temoin a etat est indispensable : `schema_exists` est une methode,
+    et la poser a `False` l'aurait faite devenir un booleen. Le flip
+    apres `execute` reproduit exactement ce qui se passe en base --
+    compte cree, puis re-verification immediate.
+    """
+
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(**kw)
+        #: Nombre de `CREATE` reels. Vide = aucune ecriture, et c'est
+        #: le seul point observe : un test ne doit pas conclure du
+        #: non-ecriture a partir d'un message.
+        self.ddl: List[str] = []
+        self.cree = False
+
+    def schema_exists(self, schema: str) -> bool:
+        self.queries.append(f"schema_exists {schema}")
+        return self.cree
+
+    def execute(self, sql: str) -> None:
+        avant = len(self.ddl)
+        super().execute(sql)
+        # Le compte n'apparait que si le DDL a reellement ete retenu
+        # jusqu'au bout — le `NullRunner` arrete la chaine en simulation.
+        if len(self.ddl) > avant:
+            self.cree = True
+
+
+def _cible_qui_apparait(**kw: Any):
+    donnees = dict(object_count=0, responses=dict(_META_CIBLE))
+    donnees["responses"].update(kw.pop("responses", None) or {})
+    donnees.update(kw)
+    return SchemaCibleCree(**donnees)
+
+
 class Scenario:
     """Un pipeline complet, arme par defaut pour reussir.
 
@@ -380,6 +434,7 @@ class Scenario:
         resume: bool = False,
         force: bool = False,
         only: Optional[Sequence[int]] = None,
+        check_only: bool = False,
         source: Optional[Any] = None,
         cible: Optional[Any] = None,
         source_runner: Optional[FauxRunner] = None,
@@ -418,10 +473,17 @@ class Scenario:
             self.target_runner = NullRunner(self.target_runner, "cible-dryrun")
 
         self.state = State(run_id=self.run_id)
+        # Les faux adaptateurs executent leurs DDL par le meme chemin que
+        # le vrai : `adapter -> runner`. C'est ce qui rend la simulation
+        # observable — sans le runner, un `dry-run` « creerait » le compte
+        # dans le faux, et l'assertion « aucune ecriture » mesurerait un
+        # temoin deja ecrit.
+        self.source_adapter.runner = self.source_runner
+        self.target_adapter.runner = self.target_runner
         self.pipeline = Pipeline(
             cfg=self.cfg, state=self.state, run_id=self.run_id,
             dry_run=dry_run, allow_destructive=allow_destructive,
-            resume=resume, force=force, only=only,
+            resume=resume, force=force, only=only, check_only=check_only,
             _source_runner=self.source_runner,
             _target_runner=self.target_runner,
             _source_adapter=self.source_adapter,
@@ -1083,8 +1145,17 @@ class TestGardeFousDeSecurite(CasDeTest):
         self.assertIn("14", s.state.error["message"])
 
     def test_le_meme_schema_avec_autorisation_passe(self):
+        """Le meme nom de schema est autorise, mais seulement sur accord.
+
+        Le refus du meme nom est un refus d'ecraser le schema lu : il
+        n'a de sens que sur une meme base. `ALLOW_EXISTING_TARGET`
+        l'accepte explicitement -- la configuration le fait deja, et
+        l'etape 2 doit lire la meme autorisation, sans quoi le remede
+        affiche par son propre message resterait sans effet.
+        """
         s = self.nouveau(
-            config={"ALLOW_EXISTING_TARGET": "true"},
+            config={"SOURCE_SCHEMA": "SRC", "TARGET_SCHEMA": "SRC",
+                    "ALLOW_EXISTING_TARGET": "true"},
             source=_adaptateur_source(responses=_INVENTAIRE),
             cible=_adaptateur_cible(
                 # Un compte unique repondrait 14 a la question « combien
@@ -1097,6 +1168,21 @@ class TestGardeFousDeSecurite(CasDeTest):
         )
         self.assertEqual(s.aller(), ec.SUCCESS)
         self.assertEqual(s.statut(7), DONE)
+
+    def test_le_meme_schema_autorise_traverse_le_garde_fou(self):
+        """Le garde-fou de l'etape 2 lit ALLOW_EXISTING_TARGET.
+
+        La configuration autorise deja le meme nom des que
+        `ALLOW_EXISTING_TARGET=true` ; l'etape 2, qui la rejoue pour la
+        reprise et les appels programmatiques, doit lire la **meme**
+        autorisation. La refuser sans la lire rendait le remede affiche
+        par son propre message -- assumer avec ALLOW_EXISTING_TARGET=true
+        -- sans aucun effet.
+        """
+        s = self.nouveau(config={"ALLOW_EXISTING_TARGET": "true"})
+        s.state.source_schema = "TGT"
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        self.assertEqual(s.statut(2), DONE)
 
     def test_la_configuration_refuse_d_abord_le_meme_schema(self):
         """Le refus est pose deux fois, et c'est la premiere qui compte.
@@ -2393,6 +2479,124 @@ class TestProprietesDerivees(CasDeTest):
         s2 = self.nouveau(config={"PARALLEL": "1"})
         s2.aller()
         self.assertEqual(s2.state.artifacts["dumpfile_spec"], "osd_R1.dmp")
+
+
+class TestCreationDuSchemaCible(CasDeTest):
+    """`CREATE_TARGET_SCHEMA` : le compte absent est cree, jamais implicitement.
+
+    Le compte absent est une situation **normale** dans une duplication :
+    la cible recoit un schema qui n'y existe pas encore. L'outil ne doit
+    cependant pas le creer pour rien, ni le creer dans un `check` qui
+    promet de ne rien ecrire. Trois niveaux de refus, donc, et trois
+    observations : l'absence de `CREATE` sur le temoin, pas un message.
+    """
+
+    CONFIG = {
+        "CREATE_TARGET_SCHEMA": "true",
+        "SOURCE_SCHEMA": "HR",
+        "TARGET_SCHEMA": "HR",
+        "ALLOW_EXISTING_TARGET": "true",
+    }
+
+    def scenario(self, **kw: Any) -> Scenario:
+        kw.setdefault("only", [7])
+        kw.setdefault("config", dict(self.CONFIG))
+        kw.setdefault("source", _adaptateur_source(responses=_META_SOURCE))
+        kw.setdefault("cible", _cible_qui_apparait())
+        return self.nouveau(**kw)
+
+    def test_le_compte_est_cree_a_l_etape_7(self):
+        s = self.scenario()
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        self.assertEqual(s.statut(7), DONE)
+        self.assertTrue(s.target_adapter.cree)
+        ddl = "\n".join(s.target_adapter.ddl)
+        self.assertIn("create user HR", ddl)
+        self.assertIn("identified by values", ddl)
+        # Le DDL est passe par le runner reel : c'est lui qui fait
+        # l'ecriture, pas un `if` sur `dry_run`.
+        self.assertTrue(any("create user HR" in m
+                            for m in s.mutations_reelles()))
+
+    def test_sans_l_option_le_compte_absent_est_toujours_refuse(self):
+        config = dict(self.CONFIG)
+        config["CREATE_TARGET_SCHEMA"] = "false"
+        s = self.scenario(config=config)
+        self.assertEqual(s.aller(), ec.PREREQ)
+        self.assertEqual(s.statut(7), FAILED)
+        self.assertEqual(s.target_adapter.ddl, [])
+
+    def test_un_compte_deja_present_n_est_pas_recree(self):
+        """Le plus des peuples, le moins des recree : la creation n'est
+        qu'un repli pour l'absence, pas une substitution de la donnee."""
+        s = self.scenario(cible=_adaptateur_cible())
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        self.assertEqual(s.statut(7), DONE)
+        self.assertEqual(s.target_adapter.ddl, [])
+
+    def test_check_decrit_la_creation_sans_l_executer(self):
+        """`check` promet de ne rien ecrire, et c'est lui qui saurait."""
+        s = self.scenario(check_only=True)
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        self.assertEqual(s.statut(7), DONE)
+        self.assertEqual(s.target_adapter.ddl, [])
+        self.assertFalse(s.target_adapter.cree)
+        # `check` ne porte meme pas la demande au runner : il n'y a rien
+        # a retenir, puisqu'il n'y a rien a ecrire.
+        self.assertFalse(any("create user" in script
+                             for _, script in s.target_runner.appels))
+        messages = [c.message for c in s.pipeline.checks]
+        self.assertTrue(any("sera cree" in m for m in messages), messages)
+        self.assertIn("creation du schema cible HR",
+                      [c.name for c in s.pipeline.checks])
+
+    def test_le_rapport_consigne_la_creation(self):
+        """Un rapport qui ne dit pas que le compte a ete cree impose de
+        relire le journal pour savoir ce que le run a vraiment fait."""
+        s = self.scenario()
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        noms = [c.name for c in s.pipeline.checks]
+        self.assertIn("creation du schema cible HR", noms)
+        self.assertIn("HR cree a l'image de HR", "\n".join(s.etape(7).detail))
+
+    def test_dry_run_ne_cree_jamais(self):
+        """Le DDL part au runner, qui le **retient** — c'est le test.
+
+        Conclure du non-ecriture a partir d'un message, ce serait
+        verifier la promesse du code dans le code. Ce qui est observe,
+        c'est la chaine : le DDL est bien arrive au runner, et c'est le
+        `NullRunner` qui l'a arrete avant la base.
+        """
+        s = self.scenario(dry_run=True)
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        self.assertEqual(s.statut(7), DONE)
+        self.assertEqual(s.target_adapter.ddl, [])
+        self.assertFalse(s.target_adapter.cree)
+        self.assertEqual(s.mutations_reelles(), [])
+        retenus = s.target_runner.scripts
+        self.assertEqual(len(retenus), 1, retenus)
+        self.assertIn("create user HR", retenus[0])
+        # Et le resume rendu au rapport est lui aussi revoyable sans
+        # exposer l'empreinte, qui est un secret craquable hors ligne.
+        resume = "\n".join(s.pipeline.withheld_mutations())
+        self.assertIn("create user HR", resume)
+        self.assertNotIn("B031DD", resume)
+        self.assertNotIn("D80021", resume)
+
+    def test_etape_15_sur_un_compte_simule_ne_releve_pas_un_abandon(self):
+        """Le compte cree en simulation n'existe pas : ce n'est pas un
+        `DROP USER`. L'etape 15 le sait, et ne conclut donc pas a un
+        schema disparu apres import."""
+        s = self.scenario(only=[15], dry_run=True, cible=_cible_qui_apparait())
+        s.state.artifacts["target_schema_created"] = "simule"
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        self.assertEqual(s.statut(15), DONE)
+
+    def test_etape_15_refuse_un_compte_absent_non_simule(self):
+        """Le garde-fou de l'etape 15 reste le meme sans simulation."""
+        s = self.scenario(only=[15], dry_run=True, cible=_cible_qui_apparait())
+        self.assertEqual(s.aller(), ec.VALIDATION)
+        self.assertEqual(s.statut(15), FAILED)
 
 
 if __name__ == "__main__":  # pragma: no cover

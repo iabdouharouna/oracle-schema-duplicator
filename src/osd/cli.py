@@ -250,6 +250,9 @@ def _cmd_pipeline(
         # et sur `check` la notion n'a pas de sens.
         force=bool(getattr(args, "force", False)),
         only=only,
+        # `check` valide les prerequis sans rien ecrire : la creation du
+        # compte cible, qui est une ecriture, doit le savoir.
+        check_only=(command == "check"),
     )
 
     code = ec.SUCCESS

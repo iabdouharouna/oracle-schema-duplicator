@@ -378,6 +378,33 @@ class TestExtractionDesArguments(unittest.TestCase):
     def test_les_simples_quotes_poses_autour_sont_retirees(self):
         self.assertEqual(_unquote("'nu'"), "nu")
 
+    def test_une_valeur_multi_lignes_est_restituee_entiere(self):
+        """Un DDL tient sur plusieurs lignes : c'est la quote qui borde,
+        pas la ligne.
+
+        Couper a la premiere ligne perd non pas seulement du texte, mais
+        la fermeture de la quote — et avec elle la possibilite pour la
+        redaction de reconnaitre ce qu'elle doit masquer.
+        """
+        script = build_script(
+            "true", ["/ as sysdba", "grant A to X;\ngrant B to Y;\n"]
+        )
+        resume = _arguments(script)
+        self.assertIn("grant A to X;", resume)
+        self.assertIn("grant B to Y;", resume)
+
+    def test_une_valeur_non_refermee_n_est_pas_restituee_brute(self):
+        """Une quote ouverte n'est pas un argument, c'est un secret a
+        risque.
+
+        La valeur non refermable est precisement celle dont on ne sait
+        pas ou elle s'arrete — celle qui peut contenir l'empreinte du
+        mot de passe. La restituer ferait porter au rapport le contenu
+        que sa redaction devait proteger, en un endroit ou personne ne
+        la re-verifie.
+        """
+        self.assertEqual(_arguments("osd_arg1='tronc\n"), "[argument non lisible]")
+
 
 class TestSubstitutionEffectiveDansLeTransfert(unittest.TestCase):
     def test_une_sonde_reelle_ne_tourne_pas_en_simulation(self):
@@ -401,6 +428,91 @@ class TestSubstitutionEffectiveDansLeTransfert(unittest.TestCase):
         self.assertIn("simule", raison)
         self.assertEqual(source.delegate.mutations(), [])
         self.assertEqual(cible.delegate.mutations(), [])
+
+
+class TestSubstitutionEffectiveDuDdl(unittest.TestCase):
+    """Le DDL passe par le runner, qui decide — jamais le pipeline.
+
+    C'est la propriete 2 du module, appliquee au seul chemin d'ecriture
+    du projet : `OracleAdapter.execute`. Le flag `mutating` y est
+    **declare**, pas demande a l'appelant, parce qu'il n'existe aucun
+    appel legitime qui ecrirait sans ecrire. Un oubli ici vaudrait :
+    le dry-run delegue au runner reel, qui applique le DDL — et le
+    rapport annonce « rien n'a ete change » sur un compte cree.
+    """
+
+    def _adaptateur(self, temoin):
+        from osd.adapters.oracle import OracleAdapter, OracleSide
+
+        return OracleAdapter(
+            OracleSide(
+                name="cible", connect="CIBLE", schema="HR",
+                directory="DP_DIR", wallet="", user="", password="",
+                sysdba=True, runner=temoin,
+            )
+        )
+
+    def test_le_ddl_est_retenu_par_le_nullrunner(self):
+        reel = RunnerTemoin()
+        null = NullRunner(reel, "dry-run")
+        oracle = self._adaptateur(null)
+
+        oracle.execute("create user OSDCREE identified by values 'S:X'")
+
+        # Le runner reel n'a rien recu : la substitution est effective,
+        # et pas seulement annoncee.
+        self.assertEqual(reel.calls, [])
+        self.assertEqual(reel.mutations(), [])
+        # Ce qui a ete retenu est le DDL lui-meme, et il est lisible :
+        # c'est lui que l'exploitant relit avant d'autoriser un run.
+        self.assertEqual(len(null.scripts), 1, null.scripts)
+        self.assertIn("create user OSDCREE", null.scripts[0])
+        self.assertIn("create user OSDCREE", " ".join(null.summary()))
+
+    def test_une_requete_reste_deleguee(self):
+        """Le drapeau ne doit pas rendre toute la base muette en simulation.
+
+        Sans les lectures, le dry-run ne pourrait ni valider la
+        connexion ni mesurer l'espace — il ne verifierait rien, et
+        dirait « tout a ete verifie ».
+        """
+        reel = RunnerTemoin()
+        oracle = self._adaptateur(NullRunner(reel, "dry-run"))
+
+        oracle.query("select 1 from dual")
+
+        self.assertTrue(reel.lectures(), "la lecture n'a pas ete deleguee")
+        self.assertEqual(reel.mutations(), [])
+
+    def test_le_resume_ne_laisse_passer_aucune_empreinte(self):
+        """Le DDL reste revoyable, l'empreinte non — et la difference
+        n'est pas de degre.
+
+        La chaine complete est exercee : le DDL part au runner, la
+        valeur est extraite du script, puis redigee. C'est le point ou
+        une extraction mal bornee laisserait une quote ouverte, et ou la
+        redaction, qui ne reconnaitrait plus une valeur fermee, ne
+        masquerait rien. Le rapport est une piece conservee, et
+        l'empreinte se craque hors ligne.
+        """
+        from osd.redact import redact
+
+        reel = RunnerTemoin()
+        null = NullRunner(reel, "dry-run")
+        oracle = self._adaptateur(null)
+
+        oracle.execute(
+            "create user OSDCREE identified by values 'S:DEADBEEF;T:CAFEBABE'"
+            " default tablespace USERS;\n"
+            "grant CREATE SESSION to OSDCREE;\n"
+        )
+
+        resume = redact(" ".join(null.summary()))
+        self.assertIn("create user OSDCREE", resume)
+        self.assertIn("default tablespace USERS", resume)
+        self.assertIn("grant CREATE SESSION", resume)
+        self.assertNotIn("DEADBEEF", resume)
+        self.assertNotIn("CAFEBABE", resume)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -21,9 +21,12 @@ from .preflight import (  # noqa: F401
     human,
     worst,
 )
+from .schema import CreateSchemaPlan, plan_create_target_schema  # noqa: F401
 
 __all__ = [
+    "CreateSchemaPlan",
     "CheckResult",
+    "plan_create_target_schema",
     "FAIL",
     "OK",
     "SKIP",

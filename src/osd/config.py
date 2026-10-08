@@ -166,6 +166,12 @@ def _schema() -> Dict[str, Spec]:
         "ALLOW_EXISTING_TARGET": Spec(
             "bool", False, doc="Refuse par defaut d'ecraser un schema cible existant."
         ),
+        "CREATE_TARGET_SCHEMA": Spec(
+            "bool", False,
+            doc="Cree le schema cible absent, a l'image du schema source "
+                "(tablespace, profil, privileges, quota, empreinte du mot "
+                "de passe).",
+        ),
         "TABLE_EXISTS_ACTION": Spec("enum", "SKIP", TABLE_EXISTS_ACTIONS),
         "ALLOW_DESTRUCTIVE": Spec("bool", False, doc="REPLACE/TRUNCATE exigent --allow-destructive."),
         "PASSWORD": Spec("password", "", secret=True, doc="Repli uniquement. Preferer le wallet."),

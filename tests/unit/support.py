@@ -74,6 +74,9 @@ class FakeAdapter:
             self._data.pop("responses", {}) or {}
         )
         self.queries: List[str] = []
+        #: DDL reellement executees. Une liste vide est le temoin d'un
+        #: `check` ou d'un dry-run : le compte a ete decrit, pas cree.
+        self.ddl: List[str] = []
         self.connect_info: Dict[str, str] = self._data.pop(
             "_connect_info",
             {"version": "19.0.0.0.0", "instance": "FAKE", "dbname": "FAKE",
@@ -81,6 +84,10 @@ class FakeAdapter:
              "session_user": "SYS", "host": "localhost"},
         )
         self.verified = False
+        #: Runner par lequel un DDL part quand le faux en porte un.
+        #: Poses par le harnais de scenario, jamais par le test : c'est
+        #: lui qui sait si la simulation autorise l'ecriture.
+        self.runner: Any = None
 
     # -- Generique -------------------------------------------------------
 
@@ -121,6 +128,32 @@ class FakeAdapter:
         if not lignes or not lignes[0]:
             return ""
         return str(lignes[0][0])
+
+    def execute(self, sql: str) -> None:
+        """Simule un DDL.
+
+        Quand le faux porte un `runner`, c'est **lui** qui decide : en
+        simulation, le `NullRunner` retient la mutation et n'ecrit rien.
+        Sans ce passage, un `dry-run` ferait apparaitre le compte cree
+        dans le faux, et le test qui cherche a prouver qu'aucune ecriture
+        n'a lieu le verifierait sur un temoin deja ecrit — il passerait
+        en regardant le mauvais endroit.
+
+        Le script est celui du vrai, `build_script` compris : c'est lui
+        qui pose les `osd_argN=`, et c'est de la que `_arguments` tire
+        le resume du rapport. Passer le SQL nu produirait un resume
+        vide, et le test verifierait alors un rapport que la chaine
+        reelle n'emplit pas.
+        """
+        from osd.runner import build_script
+
+        self.queries.append(sql)
+        runner = getattr(self, "runner", None)
+        if runner is not None:
+            runner.run_script(build_script("true", [sql]), mutating=True)
+            if not runner.allows_mutation():
+                return
+        self.ddl.append(sql)
 
     def object_count(self, schema: str, *, object_type: str = "") -> int:
         """Compte d'objets, filtrable par type.

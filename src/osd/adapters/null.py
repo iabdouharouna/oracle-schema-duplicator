@@ -40,6 +40,7 @@ chose qui rend un dry-run interpretable.
 
 from __future__ import annotations
 
+import re
 from typing import List, Optional
 
 from ..runner import Result
@@ -122,14 +123,80 @@ class NullRunner:
         return list(self.calls)
 
 
+#: Affectation d'un argument pose par `build_script`.
+#:
+#: Ancre sur une frontiere de ligne : `osd_arg1=` peut egalement se
+#: rencontrer dans le corps d'un script, ou il ne designe rien.
+_ARG_RE = re.compile(r"(?m)^osd_arg\d+=")
+
+#: Facon dont le shell represente une quote simple a l'interieur d'une
+#: chaine single-quote : fermeture, quote echappee, reouverture.
+_SHELL_QUOTE = "'\\''"
+
+#: Ce que contient un argument qu'aucune quote ne referme.
+#:
+#: Une valeur tronquee n'est pas un argument illisible, c'est un
+#: argument qu'on ne sait pas lire — et il peut contenir l'empreinte
+#: d'un mot de passe. Le restituer tel quel mettrait le secret dans le
+#: rapport que la redaction devait proteger : le silence est le seul
+#: repli honnete.
+_TROUNCHE = "[argument non lisible]"
+
+
 def _arguments(script: str) -> str:
-    """Extrait les arguments d'un script genere par `build_script`."""
-    args = [
-        line.split("=", 1)[1]
-        for line in script.splitlines()
-        if line.startswith("osd_arg")
-    ]
-    return " ".join(_unquote(a) for a in args)
+    """Extrait les arguments d'un script genere par `build_script`.
+
+    Une valeur est une chaine single-quote du shell, et une telle chaine
+    peut contenir des retours a la ligne : un DDL en contient, un par
+    instruction. Lire argument par **ligne** couperait donc la valeur a
+    sa premiere ligne. La fermeture de la quote disparaitrait avec, et
+    `_unquote`, qui la reconnait a son dernier caractere, laisserait la
+    valeur entiere partir telle quelle — empreinte de mot de passe
+    comprise — dans un rapport ou la redaction ne voit plus qu'une quote
+    ouverte et ne masque rien. Le decoupage se fait donc sur la quote,
+    pas sur la ligne.
+    """
+    out: List[str] = []
+    pos = 0
+    while True:
+        match = _ARG_RE.search(script, pos)
+        if match is None:
+            break
+        debut = match.end()
+        if debut < len(script) and script[debut] == "'":
+            fin = _end_of_quote(script, debut)
+            if fin is None:
+                out.append(_TROUNCHE)
+                pos = len(script)
+                break
+            out.append(_unquote(script[debut:fin]).strip())
+            pos = fin
+        else:
+            fin = script.find("\n", debut)
+            fin = len(script) if fin < 0 else fin
+            out.append(_unquote(script[debut:fin]).strip())
+            pos = fin
+    return " ".join(out)
+
+
+def _end_of_quote(text: str, start: int) -> Optional[int]:
+    r"""Index juste apres la quote fermante, ou `None` si elle manque.
+
+    Une quote simple a l'interieur n'est pas une fin de chaine : elle est
+    ecrite `'\''` — fermeture, quote echappee, reouverture — et le
+    parcours doit la franchir d'un bloc. S'arreter au premier `'`
+    couperait la valeur a l'exacte endroit ou commence le secret, ce qui
+    est pire que de ne rien restituer.
+    """
+    index = start + 1
+    while index < len(text):
+        if text[index] == "'":
+            if text.startswith(_SHELL_QUOTE, index):
+                index += len(_SHELL_QUOTE)
+                continue
+            return index + 1
+        index += 1
+    return None
 
 
 def _unquote(quoted: str) -> str:

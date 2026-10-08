@@ -178,15 +178,25 @@ class OracleAdapter:
         return row[0].strip()
 
     def execute(self, sql: str, *, timeout: int = SQL_TIMEOUT) -> None:
-        """Execute un enonce sans tabuler de resultat (DDL, GRANT...)."""
-        result = self._run_sql(sql, timeout=timeout)
+        """Execute un enonce sans tabuler de resultat (DDL, GRANT...).
+
+        `mutating` est **toujours** vrai : une instruction d'ecrire est
+        une ecriture par nature, et l'appelant n'a rien d'autre a
+        decidier. Sans ce drapeau, le `NullRunner` deleguerait l'enonce
+        au runner reel en mode simulation — c'est-a-dire qu'un dry-run
+        executerait exactement le DDL qu'il promet de ne pas executer.
+        La distinction n'a donc pas ete laissee a la memoire de
+        l'appelant.
+        """
+        result = self._run_sql(sql, timeout=timeout, mutating=True)
         self._raise_on_oracle_error(result, "instruction")
 
-    def _run_sql(self, sql: str, *, timeout: int) -> Result:
+    def _run_sql(self, sql: str, *, timeout: int, mutating: bool = False) -> Result:
         body = _body("remote_sqlplus.sh")
         argv = [self.side.effective_connect(), sql]
         script = _assemble(body, argv, env=self.side.env())
-        return self.side.runner.run_script(script, timeout=timeout)
+        return self.side.runner.run_script(script, timeout=timeout,
+                                           mutating=mutating)
 
     def _raise_on_oracle_error(self, result: Result, what: str) -> None:
         # Un `OSD_FATAL` est un echec du **script d'hote**, anterieur a

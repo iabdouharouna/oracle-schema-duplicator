@@ -122,8 +122,18 @@ compte distinct du schéma dupliqué.
 
 ## Étape 6 et 7 — schémas
 
-**Le schéma cible n'existe pas.** L'outil ne crée pas de compte : cela relève
-de l'initialisation de la base. Le créer, puis relancer.
+**Le schéma cible n'existe pas.** Refusé par défaut : créer le compte, puis
+relancer — ou poser `CREATE_TARGET_SCHEMA=true` pour que l'outil le crée à
+l'image du schéma source : tablespace par défaut et temporaire (après
+`REMAP_TABLESPACE`), profil, privilèges système, rôles, quota, et empreinte du
+mot de passe (`IDENTIFIED BY VALUES`, jamais en clair).
+
+L'outil ne crée **pas** de tablespace : un tablespace par défaut ou temporaire
+absent côté cible est un échec prerequis (code 2), avec remède. Un profil
+absent retombe sur `DEFAULT`, un rôle absent est ignoré avec un avertissement.
+
+`check` et `--dry-run` ne créent rien : ils annoncent « sera créé », puis
+arrêtent au périmètre normal (étapes 1 à 9 pour `check`).
 
 **Le schéma cible contient déjà des objets.** `ALLOW_EXISTING_TARGET` est
 requis. C'est un garde-fou, pas un avertissement : un run quotidien qui écrase

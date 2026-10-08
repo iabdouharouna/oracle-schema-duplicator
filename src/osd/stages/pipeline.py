@@ -37,6 +37,7 @@ from ..adapters import transfer as transfer_mod
 from ..adapters.transfer import TransferBackend
 from ..checks import preflight
 from ..checks.preflight import FAIL, OK, SKIP, WARN, CheckResult, human
+from ..checks.schema import plan_create_target_schema
 from ..config import validate_identifier
 from ..errors import (
     ConfigError,
@@ -100,6 +101,10 @@ class Pipeline:
     resume: bool = False
     force: bool = False
     only: Optional[Sequence[int]] = None
+    #: `check` valide les prerequis (etapes 1 a 9) sans rien ecrire. La
+    #: creation du compte cible etant une ecriture, elle doit savoir
+    #: qu'elle est en `check` pour se contenter de la *decrire*.
+    check_only: bool = False
 
     checks: List[CheckResult] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
@@ -290,12 +295,23 @@ class Pipeline:
         detail: List[str] = []
         destructive, reason = self.cfg.is_destructive()
 
-        if self.state.source_schema == self.state.target_schema:
+        # Meme nom de schema : ce n'est une faute que si la source et la
+        # cible sont la **meme base**, auquel cas l'import ecraserait le
+        # schema qu'il vient de lire. La configuration porte deja ce
+        # refus, et autorise explicitement le cas avec
+        # `ALLOW_EXISTING_TARGET` ; l'etape 2 rejoue le controle pour la
+        # reprise et les appels programmatiques, et doit donc lire la
+        # meme autorisation. La refuser ici sans la lire rendait la
+        # configuration contradictoire avec son propre remede.
+        if (self.state.source_schema == self.state.target_schema
+                and not self.cfg.get("ALLOW_EXISTING_TARGET")):
             raise SecurityError(
                 f"source et cible identiques ({self.state.source_schema})",
-                hint="REMAP_SCHEMA ne sert a rien quand le nom est le meme. "
-                     "Utiliser un autre TARGET_SCHEMA, ou assumer explicitement "
-                     "avec ALLOW_EXISTING_TARGET=true.",
+                hint="Un export puis import dans le meme schema n'est une "
+                     "duplication que si la cible est une autre base. Pour "
+                     "l'assumer explicitement, poser "
+                     "ALLOW_EXISTING_TARGET=true ; sinon utiliser un autre "
+                     "TARGET_SCHEMA.",
             )
 
         if self.allow_destructive:
@@ -391,6 +407,12 @@ class Pipeline:
         **code 8** (securite) et non un code 2, parce que la situation
         n'est pas un prerequis manquant mais une operation qui n'a pas
         ete explicitement demandee.
+
+        Quand `CREATE_TARGET_SCHEMA=true` et que le compte cible est
+        absent, il est cree ici a l'image du compte source. La creation
+        est une ecriture : `check` ne la formule meme pas, et en
+        `dry-run` le DDL part au `NullRunner`, qui le retient — il est
+        donc revoyable dans le rapport sans avoir atteint la base.
         """
         schema = self.state.target_schema
         allow_existing = self.cfg.get("ALLOW_EXISTING_TARGET")
@@ -399,8 +421,75 @@ class Pipeline:
             # cas particulier.
             allow_existing = True
 
+        detail: List[str] = []
+
+        if (self.cfg.get("CREATE_TARGET_SCHEMA")
+                and not self.target_adapter.schema_exists(schema)):
+            plan = plan_create_target_schema(
+                self.source_adapter,
+                self.target_adapter,
+                source_schema=self.state.source_schema,
+                target_schema=schema,
+                remap_tablespace=self._remap_pairs(),
+            )
+            creation_detail = list(plan.detail)
+            for warning in plan.warnings:
+                # Le journal enregistre le remede, pas le resultat :
+                # un avertissement silencieux n'en est pas un.
+                LOG.warning("%s", redact(warning))
+                creation_detail.append(f"avertissement : {warning}")
+            detail.extend(creation_detail)
+
+            if not self.check_only:
+                # C'est le `NullRunner` qui decide, pas un `if` sur
+                # `dry_run` : en simulation le DDL est retenu, il figure
+                # aux mutations non executees et au corps du rapport, et
+                # il n'atteint jamais la base. Un `if` ici ferait
+                # diverger la simulation du run reel — et c'est le mode
+                # cense preparer ce run.
+                self.target_adapter.execute(";\n".join(plan.statements) + ";\n")
+
+            if self.check_only or self.dry_run:
+                # Ni `check` ni simulation ne peuvent verifier un compte
+                # qu'ils ne creent pas : la re-verification porterait sur
+                # une base qui n'a pas change.
+                raison = "check" if self.check_only else "simulation"
+                detail.append(
+                    f"{raison} : le compte sera cree, aucune ecriture"
+                )
+                self.state.metrics["target_objects_before"] = 0
+                self.state.artifacts["target_schema_created"] = "simule"
+                self.checks.append(CheckResult(
+                    name=f"creation du schema cible {schema}",
+                    status=WARN,
+                    code=ec.SUCCESS,
+                    message=f"le schema {schema} sera cree "
+                            f"(CREATE_TARGET_SCHEMA=true)",
+                    detail=creation_detail,
+                ))
+                self._record(
+                    7, STEP_NAMES[7],
+                    message=f"schema cible {schema} sera cree",
+                    detail=detail,
+                )
+                return
+
+            self.state.artifacts["target_schema_created"] = "oui"
+            self.checks.append(CheckResult(
+                name=f"creation du schema cible {schema}",
+                message=f"{schema} cree a l'image de "
+                        f"{self.state.source_schema}",
+                detail=creation_detail,
+            ))
+            detail.append(
+                f"schema {schema} cree a l'image de {self.state.source_schema}"
+            )
+            LOG.info("schema cible %s cree a l'image de %s",
+                     schema, self.state.source_schema)
+
         result = preflight.check_target_schema(
-            self.target_adapter, schema, allow_existing=bool(allow_existing)
+            self.target_adapter, schema, allow_existing=bool(allow_existing),
+            can_create=bool(self.cfg.get("CREATE_TARGET_SCHEMA")),
         )
         self.checks.append(result)
         if result.failed:
@@ -416,7 +505,6 @@ class Pipeline:
         objects = result.data.get("objects", 0)
         self.state.metrics["target_objects_before"] = objects
 
-        detail: List[str] = []
         action = self.cfg.get("TABLE_EXISTS_ACTION")
         if objects:
             detail.append(f"TABLE_EXISTS_ACTION={action}")
@@ -1159,6 +1247,21 @@ class Pipeline:
         detail: List[str] = []
 
         if not self.target_adapter.schema_exists(schema):
+            if (self.dry_run
+                    and self.state.artifacts.get("target_schema_created") == "simule"):
+                # En simulation, le compte n'a pas ete cree : c'est le
+                # propre du dry-run. Son absence n'est donc pas un
+                # « schema disparu apres import », mais l'etat de depart
+                # que la simulation decrit -- et l'import, qui n'a pas eu
+                # lieu, n'y change rien.
+                detail.append(
+                    "simulation : le compte sera cree par l'execution "
+                    "reelle, il n'existe pas encore"
+                )
+                self.state.metrics["target_objects_after"] = 0
+                self.state.metrics["target_invalid_after"] = 0
+                self._step_15_dry(0, 0, detail)
+                return
             raise ValidationError(f"le schema cible {schema} n'existe plus apres import")
 
         objects = self.target_adapter.object_count(schema)
@@ -1523,7 +1626,12 @@ class Pipeline:
                                ("cible", self.target_runner)):
             if runner.kind == "null":
                 for item in runner.summary():
-                    out.append(f"[{prefix}] {item}")
+                    # Redaction a la source et pas seulement au rendu :
+                    # le resume part aussi dans le rapport JSON, ou
+                    # rien n'appelle `redact`. Un DDL porte l'empreinte
+                    # du mot de passe du compte, et ce rapport est
+                    # conserve comme piece.
+                    out.append(redact(f"[{prefix}] {item}"))
         return out
 
     def _make_side(self, name: str) -> OracleSide:

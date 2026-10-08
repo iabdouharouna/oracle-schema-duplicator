@@ -157,6 +157,34 @@ class TestScenario03SchemaInexistant(unittest.TestCase):
         self.assertIn("n'existe pas", r.message)
         self.assertIn("ne cree pas de schema", r.hint)
 
+    def test_le_remede_nomme_l_autorisation_de_creation(self):
+        """Un remede doit indiquer l'action que l'outil accepte.
+
+        Sans `CREATE_TARGET_SCHEMA`, affirmer que l'outil ne cree pas de
+        schema est vrai mais incomplet : l'exploitant peut l'y autoriser.
+        Lui dire qu'il ne peut rien faire l'envoie creer le compte a la
+        main, alors que l'outil sait le faire.
+        """
+        r = preflight.check_target_schema(
+            FakeAdapter(schema_exists=False), "NOPE", allow_existing=False
+        )
+        self.assertIn("CREATE_TARGET_SCHEMA", r.hint)
+
+    def test_avec_l_autorisation_le_remede_ne_ment_pas(self):
+        """Avec `CREATE_TARGET_SCHEMA`, « l'outil ne cree pas » est faux.
+
+        Le constat reste le meme : le compte absent. Seul le remede
+        change, parce que c'est lui qui doit refleter ce que la
+        configuration autorise. Le garder inchange mentirait sur un
+        etat de configuration que l'exploitant a verifie.
+        """
+        r = preflight.check_target_schema(
+            FakeAdapter(schema_exists=False), "NOPE",
+            allow_existing=False, can_create=True,
+        )
+        self.assertEqual(r.status, FAIL)
+        self.assertNotIn("ne cree pas de schema", r.hint)
+
     def test_le_remede_donne_la_requete_de_verification(self):
         """Un remede sans commande a executer n'est pas un remede.
 
