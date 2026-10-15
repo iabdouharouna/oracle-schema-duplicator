@@ -390,7 +390,14 @@ class OracleAdapter:
             }
         return out
 
-    def schema_segment_bytes(self, schema: str, *, content: str = "ALL") -> int:
+    def schema_segment_bytes(
+        self,
+        schema: str,
+        *,
+        content: str = "ALL",
+        segment_signatures: Sequence[str] = (),
+        object_signatures: Sequence[str] = (),
+    ) -> int:
         """Estime la taille des donnees a dupliquer.
 
         Le calcul depend du contenu demande, ce qui est la consequence
@@ -401,19 +408,37 @@ class OracleAdapter:
         * `METADATA_ONLY` : l'export ne transporte que le DDL, la taille
           du dump est de l'ordre du nombre d'objets et non du volume.
 
+        `segment_signatures` designe les objets dont les segments ne
+        voyagent pas — les tables filtrees, leurs index, leurs LOB — et
+        `object_signatures` les objets absents du dump. Les deux viennent
+        du plan de filtrage de l'etape 6 : une table exportee sans ses
+        lignes ne change rien au DDL, elle ne consomme donc rien dans le
+        cas `METADATA_ONLY`, tandis que ses segments, elle, ne partent
+        plus dans les deux cas. Retrancher les deux listes au hasard
+        aurait donc pessimise un cas et ignore l'autre.
+
+        L'ecart de precision est toujours dans le meme sens : un objet
+        non reconnu reste dans le total, et l'estimation est alors trop
+        haute. Une place sur-estimee fait refuser un run inutilement ;
+        une place sous-estimee le fait s'arreter a mi-parcours.
+
         L'estimation est volontairement prudente : elle sert a refuser
         une duplication qui n'a pas de place, pas a dimensionner un
         tablespace.
         """
         if content == "METADATA_ONLY":
-            count = self.object_count(schema)
+            count = max(0, self.object_count(schema) - len(object_signatures))
             # Ordre de grandeur empirique : quelques dizaines de kilo-octets
             # par objet dans un dump texte compresse.
             return count * 64 * 1024
+
         sql = (
             "select sum(nvl(bytes, 0)) from dba_segments "
             f"where owner = '{_lit(schema)}'"
         )
+        exclus = _segments_exclus(segment_signatures)
+        if exclus:
+            sql += f" and not ({exclus})"
         try:
             return _to_int(self.scalar(sql))
         except OsdError:
@@ -456,6 +481,71 @@ def _assemble(
     from ..runner import build_script
 
     return build_script(body, argv, env=env)
+
+
+def _segments_exclus(signatures: Sequence[str]) -> str:
+    """Predicat SQL retranchant les segments des objets non dupliques.
+
+    Le type d'objet porte le filtre, jamais le nom seul : les noms
+    circulent librement dans un schema, et retrancher un segment parce
+    qu'il s'appelle comme une table filtrees retirerait les octets d'un
+    objet sans rapport — une place manquante que rien n'expliquerait
+    plus tard.
+
+    Les types cites sont ceux de `DBA_SEGMENTS`, observes sur la 19c
+    reelle, et ils ne sont pas ceux de `DBA_OBJECTS` :
+
+    * un segment de partition porte le **nom de la table ou de l'index**,
+      pas celui de la partition (`AQ$_SUBSCRIBER_LWM` en occupe plusieurs,
+      `WRP$_REPORTS_IDX01` egalement ; zero divergence sur toute la base) ;
+    * les LOB sont `LOBSEGMENT` et `LOBINDEX` cote segments, alors que
+      les objets sont `LOB` et `INDEX` cote `DBA_OBJECTS`, sous les noms
+      generes `SYS_LOB...$$` et `SYS_IL...$$` — les deux exposes par
+      `DBA_LOBS`.
+
+    Retourne une chaine vide quand rien n'est filtre : l'appelant omet
+    alors la clause, et la requete reste celle d'avant.
+    """
+    tables: List[str] = []
+    index: List[str] = []
+    lob: List[str] = []
+    for brut in signatures:
+        sig = str(brut)
+        if "~" not in sig:
+            continue
+        type_obj, nom = sig.split("~", 1)
+        type_obj, nom = type_obj.strip(), nom.strip()
+        if not nom:
+            continue
+        if type_obj.startswith("TABLE"):
+            tables.append(nom)
+        elif type_obj.startswith("INDEX"):
+            index.append(nom)
+        elif type_obj.startswith("LOB"):
+            lob.append(nom)
+
+    clauses: List[str] = []
+    for types, noms in (
+        ("TABLE", tables),
+        ("INDEX", index),
+        ("LOB", lob),
+    ):
+        if not noms:
+            continue
+        if types == "TABLE":
+            segment_types = "'TABLE', 'TABLE PARTITION', 'TABLE SUBPARTITION'"
+        elif types == "INDEX":
+            # `LOBINDEX` est ici : l'objet est un `INDEX` cote
+            # `DBA_OBJECTS`, mais son segment est un index de LOB.
+            segment_types = ("'INDEX', 'INDEX PARTITION', "
+                             "'INDEX SUBPARTITION', 'LOBINDEX'")
+        else:
+            segment_types = "'LOBSEGMENT', 'LOB PARTITION', 'LOB SUBPARTITION'"
+        liste = ", ".join("'" + _lit(n) + "'" for n in sorted(set(noms)))
+        clauses.append(
+            f"(segment_type in ({segment_types}) and segment_name in ({liste}))"
+        )
+    return " or ".join(clauses)
 
 
 def _lit(value: str) -> str:

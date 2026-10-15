@@ -28,6 +28,7 @@ from .. import exit_codes as ec
 from ..adapters import null as null_mod
 from ..adapters.datapump import (
     DataPumpAdapter,
+    DATAPUMP_IMPORT_REF_TOLERATED,
     DATAPUMP_OK_STATES,
     DATAPUMP_REMEDES,
     DATAPUMP_SUCCESS_CODES,
@@ -38,6 +39,7 @@ from ..adapters.transfer import TransferBackend
 from ..checks import preflight
 from ..checks.preflight import FAIL, OK, SKIP, WARN, CheckResult, human
 from ..checks.schema import plan_create_target_schema
+from ..checks.table_filter import TableFilterPlan, plan_table_filter, signature
 from ..config import validate_identifier
 from ..errors import (
     ConfigError,
@@ -381,6 +383,13 @@ class Pipeline:
         necessaire des l'etape 9 pour estimer l'espace, et le recalculer
         plus tard ferait deux lectures de `DBA_OBJECTS` pour le meme
         resultat, sur un schema volumineux.
+
+        Le filtrage des tables est egalement **resolu ici**, contre le
+        schema source reel, puis fige dans l'etape : l'etape 9 en a
+        besoin pour l'estimation, l'etape 11 pour le parfile, l'etape 16
+        pour la comparaison — et un `resume` doit rejouer l'export avec
+        la meme liste que celle de l'export qu'il rejoue, meme si le
+        schema a change entre les deux.
         """
         schema = self.state.source_schema
         result = preflight.check_source_schema(
@@ -390,14 +399,78 @@ class Pipeline:
         if result.failed:
             raise PrereqError(result.message, detail=result.detail, hint=result.hint)
 
+        plan = self._table_filter_plan()
+        filtre = preflight.check_table_filter(plan)
+        detail = list(result.detail)
+        if filtre is not None:
+            self.checks.append(filtre)
+            detail.extend(filtre.detail)
+            if filtre.warning:
+                # Le journal enregistre le remede, pas le resultat : un
+                # avertissement silencieux n'en est pas un. `filtre.hint`
+                # est la moitie utile du message, et elle est faite pour
+                # etre lue dans un journal comme dans un rapport.
+                texte = filtre.message
+                if filtre.hint:
+                    texte = f"{texte} — {filtre.hint}"
+                LOG.warning("%s", redact(texte))
+
         objects = result.data.get("objects", 0)
         self.state.metrics["source_objects"] = objects
+        hors = len(plan.ignored)
         self._record(
             6,
             STEP_NAMES[6],
-            message=f"{objects} objet(s)",
-            detail=[d for d in result.detail],
+            message=f"{objects} objet(s)"
+                    + (f", {hors} hors duplication" if hors else ""),
+            detail=detail,
         )
+
+    def _table_filter_plan(self) -> TableFilterPlan:
+        """Plan de filtrage des tables, fige des sa premiere resolution.
+
+        La lecture passe d'abord par l'etat : c'est ce qui rend un
+        `resume` coherent. Le plan resolu a l'etape 6 est celui de
+        l'export qui suit ; le recalculer sur un schema change ferait un
+        dump qui ne correspond plus ni a l'etat, ni a la comparaison de
+        l'etape 16.
+
+        L'ecriture se fait ici, et non dans `_step_06` seule, pour
+        qu'une execution qui sauterait cette etape ne se retrouve pas
+        sans filtre : une option qui disparait en cours de route est plus
+        dangereuse qu'une option refusee.
+        """
+        brut = self.state.artifacts.get("table_filter")
+        if isinstance(brut, dict):
+            return TableFilterPlan.from_dict(brut)
+        plan = plan_table_filter(
+            self.source_adapter,
+            self.state.source_schema,
+            tables=self.cfg.get("EXCLUDE_TABLES"),
+            tables_regex=self.cfg.get("EXCLUDE_TABLES_REGEX"),
+            tables_data=self.cfg.get("EXCLUDE_TABLES_DATA"),
+            tables_data_regex=self.cfg.get("EXCLUDE_TABLES_DATA_REGEX"),
+        )
+        self.state.artifacts["table_filter"] = plan.to_dict()
+        return plan
+
+    def _exclude_clauses(self) -> List[str]:
+        """`EXCLUDE` du parfile : configuration et tables hors duplication.
+
+        Une ligne par filtre et jamais une chaine fusionnee : en 19c le
+        separateur `;` n'existe pas, et `exclude=USER;TABLE:"..."` est
+        rejete en `ORA-39038`.
+
+        La clause du mode A figure a l'export **et** a l'import. Le dump
+        ne contient deja plus la table, mais `EXCLUDE` a l'import dit ce
+        que l'outil est en train de lire — et c'est cette meme lecture
+        que la relecture du dump a l'etape 12 annonce.
+        """
+        clauses = [str(c) for c in self.cfg.get("EXCLUDE")]
+        clause = self._table_filter_plan().exclude_clause()
+        if clause:
+            clauses.append(clause)
+        return clauses
 
     def _step_07(self) -> None:
         """Verifie le schema cible et applique le garde-fou d'ecrasement.
@@ -701,8 +774,12 @@ class Pipeline:
         sert a refus tot, pas a garantir l'issue.
         """
         content = self.cfg.get("CONTENT")
+        plan = self._table_filter_plan()
         source_bytes = self.source_adapter.schema_segment_bytes(
-            self.state.source_schema, content=content
+            self.state.source_schema,
+            content=content,
+            segment_signatures=plan.segment_ignored,
+            object_signatures=plan.ignored,
         )
         self.state.metrics["source_bytes"] = source_bytes
 
@@ -822,8 +899,12 @@ class Pipeline:
             parallel=self.cfg.get("PARALLEL"),
             filesize_mb=self.cfg.get("FILESIZE_MB"),
             remap_tablespace=self._remap_pairs(),
-            exclude=self.cfg.get("EXCLUDE"),
+            exclude=self._exclude_clauses(),
             include=self.cfg.get("INCLUDE"),
+            # `QUERY` n'est pose qu'ici : le dump ne contient deja plus
+            # les lignes visees, et rien ne justifierait de les rejeter
+            # une seconde fois a l'import.
+            query=self._table_filter_plan().query_lines(),
         )
         result = pump.run(
             "expdp",
@@ -1209,7 +1290,7 @@ class Pipeline:
             parallel=self.cfg.get("PARALLEL"),
             table_exists_action=action,
             remap_tablespace=self._remap_pairs(),
-            exclude=self.cfg.get("EXCLUDE"),
+            exclude=self._exclude_clauses(),
             include=self.cfg.get("INCLUDE"),
         )
         result = pump.run(
@@ -1218,8 +1299,8 @@ class Pipeline:
             job_name=self.state.artifacts["job_name"] + "_IMP",
             timeout=None,
         )
-        self._assert_datapump(result, tool="impdp")
         if result.simulated:
+            self._assert_datapump(result, tool="impdp")
             # `imported` n'est pas positionne : un `resume` qui le
             # verifierait doit savoir que la cible n'a pas ete touchee.
             self._record(
@@ -1228,8 +1309,89 @@ class Pipeline:
                         f"(TABLE_EXISTS_ACTION={action})",
             )
             return
+
+        if self._ref_constraints_tolerees(result):
+            self._record_import_ref_constraints(result, action=action)
+            self.state.artifacts["imported"] = True
+            return
+
+        self._assert_datapump(result, tool="impdp")
         self.state.artifacts["imported"] = True
         self._record(14, STEP_NAMES[14], message=f"import termine (TABLE_EXISTS_ACTION={action})")
+
+    def _ref_constraints_tolerees(self, result) -> bool:
+        """Le mode B explique-t-il, a lui seul, l'echec de l'import ?
+
+        Vrai lorsque **toutes** ces conditions sont reunies :
+
+        1. un filtre de donnees (mode B) est actif — sans lui, un
+           `ORA-02298` n'a aucune raison d'etre attendu ;
+        2. la sortie ne porte **que** des codes de l'ensemble tolere
+           (`ORA-02298`, `ORA-39083`) — un seul code etranger rend la
+           main au chemin d'echec ;
+        3. l'etat du job, quand il est lisible, est `COMPLETED` — un job
+           `FAILED` ou interrompu n'est jamais un « mode B nominal ».
+
+        Le troisieme point est le meme signal que `_assert_datapump`
+        consulte : l'etat prime sur le compteur d'erreurs, et un job dont
+        l'etat n'a pas pu etre lu ne doit pas passer pour termine.
+        """
+        plan = self._table_filter_plan()
+        if not plan.data_only:
+            return False
+        if not result.error_codes:
+            return False
+        if not set(result.error_codes) <= DATAPUMP_IMPORT_REF_TOLERATED:
+            return False
+
+        status = self._job_status(result.job_name, side="target")
+        if status:
+            self.state.metrics.setdefault("datapump_jobs", {})[result.job_name] = status
+            etat = (status.get("state") or "").strip().upper()
+            if etat and etat not in DATAPUMP_OK_STATES:
+                return False
+        return True
+
+    def _record_import_ref_constraints(self, result, *, action: str) -> None:
+        """Rapporte les FK non creables, sans faire echouer le run.
+
+        Le dump est complet et l'import a charge tout ce qu'il pouvait :
+        ce qui reste en arriere est une contrainte que le mode B rend
+        insatisfiable par construction. Le run se poursuit donc, mais le
+        fait est **nomme** — contraintes comprises quand la sortie les
+        nomme — exactement comme les autres avertissements du rapport.
+        """
+        noms = list(result.failed_constraints)
+        detail = ["codes d'erreur : " + ", ".join(result.error_codes)]
+        if noms:
+            detail.append("contrainte(s) non creee(s) : " + ", ".join(noms))
+        detail.append(
+            "cause : donnees exclues (mode B) sur une table parente ; "
+            "les cles parentes manquent pour valider la FK"
+        )
+        message = (
+            f"{len(noms)} contrainte(s) referentielle(s) non creee(s)"
+            if noms else
+            "contrainte(s) referentielle(s) non creee(s)"
+        )
+        self.checks.append(CheckResult(
+            name="contraintes referentielles",
+            status=WARN,
+            code=ec.IMPORT,
+            message=message,
+            detail=detail,
+            hint="Consequence attendue de EXCLUDE_TABLES_DATA : une table "
+                 "enfant garde ses lignes alors que sa table parente a ete "
+                 "exportee sans donnees. Pour l'eviter, exclure aussi les "
+                 "donnees des tables enfants, ou ne pas exclure celles des "
+                 "parents.",
+        ))
+        LOG.warning("import : %s (%s)", message, "; ".join(detail))
+        self._record(
+            14, STEP_NAMES[14],
+            message=f"import termine (TABLE_EXISTS_ACTION={action}), {message}",
+            detail=detail,
+        )
 
     # ------------------------------------------------------------------
     # Etapes 15 et 16 — validation et comparaison
@@ -1349,6 +1511,19 @@ class Pipeline:
         src = self._inventory(src_schema)
         tgt = self._inventory(tgt_schema)
 
+        # Les objets hors duplication ne sont pas sur la cible, et ce
+        # n'est pas un manque : l'export les a volontairement omis, avec
+        # leurs dependants, de facon declaree a l'etape 6. La comparaison
+        # porte donc sur la source **amoindrie** de ce que l'outil a
+        # decide de ne pas dupliquer — c'est la seule facon de ne pas
+        # valider un manque qu'on a provoque soi-meme.
+        plan = self._table_filter_plan()
+        hors_filtrage: List[str] = []
+        if plan.ignored:
+            filtres = set(plan.ignored)
+            hors_filtrage = [s for s in src if s in filtres]
+            src = [s for s in src if s not in filtres]
+
         missing = sorted(set(src) - set(tgt))
         extra = sorted(set(tgt) - set(src))
         self.state.metrics["comparison"] = {
@@ -1359,6 +1534,12 @@ class Pipeline:
         }
 
         detail: List[str] = []
+        if hors_filtrage:
+            detail.append(
+                f"{len(hors_filtrage)} objet(s) volontairement non duplique(s) "
+                f"(filtre de tables) — le filtre ne supprime rien de ce qui "
+                f"existe deja sur la cible"
+            )
         if missing:
             detail.append(f"{len(missing)} objet(s) absent(s) de la cible : {', '.join(missing[:10])}")
         if extra:
@@ -1389,8 +1570,9 @@ class Pipeline:
                 f"l'inventaire cible ne correspond pas a la source "
                 f"({len(missing)} objet(s) manquant(s))",
                 detail=detail,
-                hint="Verifier le niveau de validation, les clauses EXCLUDE, "
-                     "et consulter le journal Data Pump de l'import.",
+                hint="Verifier le niveau de validation, le filtre de tables, "
+                     "les clauses EXCLUDE, et consulter le journal Data Pump "
+                     "de l'import.",
             )
         self._record(
             16,
@@ -1405,6 +1587,12 @@ class Pipeline:
         La signature est `TYPE~NOM`, ce qui evite qu'un index et une table
         de meme nom soient confondus. Le nom de schema est exclu, puisque
         REMAP_SCHEMA le change par construction.
+
+        La construction est partagee avec `checks.table_filter` : c'est
+        le **meme** format des deux cotes, et c'est la condition de
+        l'etape 16. Une signature fabriquee ici a la main, avec une autre
+        regle de decoupage, produirait un objet manquant qu'aucun message
+        n'expliquerait.
         """
         # L'adaptateur est choisi sur le nom du schema, et non sur la
         # position du parametre : les deux etapes interrogees portent
@@ -1420,7 +1608,7 @@ class Pipeline:
             f"where owner = '{_lit(schema)}' and object_type not in "
             "('SYNONYM', 'DATABASE LINK') order by object_type, object_name"
         )
-        return [f"{row[0].strip()}~{row[1].strip()}" for row in rows if len(row) > 1]
+        return [signature(str(row[0]), str(row[1])) for row in rows if len(row) > 1]
 
     # ------------------------------------------------------------------
     # Etapes 17 a 19 — rapport, nettoyage, retour

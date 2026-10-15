@@ -344,12 +344,16 @@ class TestParfileDExport(unittest.TestCase):
         self.assertNotIn("reuse_dumpfiles=", " ".join(self.parfile(reuse=False)))
 
     def test_les_remappings_utilisent_les_separateurs_data_pump(self):
-        """`,` pour les tablespaces, `;` pour include/exclude.
+        """`,` pour les tablespaces, une ligne par filtre pour la portee.
 
         Ce sont des conventions Data Pump, pas des separateurs
-        generiques : inverses, l'option est **simplement ignoree**, sans
-        erreur. Un job qui « reussit » en ecrivant dans les mauvaises
-        tablespaces ne dit rien de ce qui s'est passe.
+        generiques. Pour `include=` et `exclude=`, il n'en existe
+        **aucun** : `TABLE:"T1";TABLE:"T2"` est lu comme un seul type
+        d'objet `TABLE:"T1";TABLE:"T2"` et refuse en `ORA-39038` (mesure
+        sur une 19c reelle : le parfile a separateur echoue, les deux
+        lignes reussissent). Inverse, l'option est sans effet, et un job
+        qui « reussit » en exportant trop ne dit rien de ce qui s'est
+        passe.
         """
         lignes = self.parfile(
             remap_tablespace=["USERS:TS_A", "SYSAUX:TS_B"],
@@ -357,8 +361,46 @@ class TestParfileDExport(unittest.TestCase):
             exclude=['TABLE:"X"'],
         )
         self.assertIn("remap_tablespace=USERS:TS_A,SYSAUX:TS_B", lignes)
-        self.assertIn('include=TABLE:"T1";TABLE:"T2"', lignes)
-        self.assertIn('exclude=TABLE:"X"', lignes)
+        self.assertEqual(
+            [l for l in lignes if l.startswith("include=")],
+            ['include=TABLE:"T1"', 'include=TABLE:"T2"'],
+            "chaque filtre a sa propre ligne, jamais fusionne",
+        )
+        self.assertEqual(
+            [l for l in lignes if l.startswith("exclude=")],
+            ['exclude=TABLE:"X"'],
+        )
+
+    # -- QUERY : le mode « structure sans donnees » ------------------------
+
+    def test_une_query_par_table_sans_donnees(self):
+        """Une ligne `query=` par table, et les deux sont appliquees.
+
+        Mesure sur une 19c reelle : `query=HR.REGIONS:"WHERE 1=2"` suivi
+        de `query=HR.COUNTRIES:"WHERE 1=2"` rend deux lignes `0 rows`
+        dans le journal, `rc=0`. Le second parametre n'est donc ni
+        rejete ni ignore — ce qui n'etait pas une hypothese a prendre au
+        serieux, `QUERY` designant `SCHEMA.TABLE` plutot qu'une liste.
+        """
+        lignes = self.parfile(query=[
+            'SRC.EMPLOYEES:"WHERE 1=2"',
+            'SRC.REGIONS:"WHERE 1=2"',
+        ])
+        self.assertEqual(
+            [l for l in lignes if l.startswith("query=")],
+            ['query=SRC.EMPLOYEES:"WHERE 1=2"',
+             'query=SRC.REGIONS:"WHERE 1=2"'],
+        )
+
+    def test_sans_filtre_de_donnees_il_n_y_a_aucune_query(self):
+        """Une `query=` sans valeur est une erreur de syntaxe, pas un filtre."""
+        self.assertEqual(
+            [l for l in self.parfile() if l.startswith("query=")], [])
+
+    def test_une_entree_de_query_vide_est_ecartee(self):
+        self.assertEqual(
+            [l for l in self.parfile(query=["  ", ""])
+             if l.startswith("query=")], [])
 
 
 class TestParfileDImport(unittest.TestCase):
@@ -482,13 +524,16 @@ class TestParfileDImport(unittest.TestCase):
         Une exclusion demandee qui disparaissait au profit de la seule
         exclusion obligatoire changerait le contenu du schema duplique,
         en silence : le rapport ne dirait rien de l'objet omis.
+
+        L'union se lit sur **une ligne par filtre** : il n'y a aucun
+        separateur de fusion, `;` serait refuse en `ORA-39038`.
         """
         lignes = self.parfile(exclude=["TABLE:DEPT", "VIEW:HR.V_TEST"])
         exclu = [l for l in lignes if l.startswith("exclude=")]
-        self.assertEqual(len(exclu), 1, exclu)
-        self.assertIn("TABLE:DEPT", exclu[0])
-        self.assertIn("VIEW:HR.V_TEST", exclu[0])
-        self.assertIn("USER", exclu[0])
+        self.assertEqual(
+            exclu,
+            ["exclude=USER", "exclude=TABLE:DEPT", "exclude=VIEW:HR.V_TEST"],
+        )
 
     def test_une_exclusion_ne_reparait_pas(self):
         """La deduplication ignore la casse, pour que le parfile se lise.
@@ -516,9 +561,21 @@ class TestParfileDImport(unittest.TestCase):
         """
         lignes = self.parfile(sqlfile="v.sql", exclude=["TABLE:DEPT"])
         exclu = [l for l in lignes if l.startswith("exclude=")]
-        self.assertEqual(len(exclu), 1, lignes)
-        self.assertIn("USER", exclu[0])
-        self.assertIn("TABLE:DEPT", exclu[0])
+        self.assertEqual(
+            exclu, ["exclude=USER", "exclude=TABLE:DEPT"], lignes
+        )
+
+    def test_l_import_ne_recoit_jamais_la_query(self):
+        """Le mode B n'agit qu'a l'export, et la signature le dit.
+
+        Le dump ne contient deja plus les lignes : repeter `QUERY` a
+        l'import ne ferait que rejeter ce qui n'y est pas. Le refus est
+        ici un `TypeError`, avant toute connexion — un parametre
+        oubliable n'est pas un parametre, c'est une divergence d'ecriture
+        qui se decouvrirait sur un job deja lance.
+        """
+        with self.assertRaises(TypeError):
+            self.parfile(query=['HR.REGIONS:"WHERE 1=2"'])
 
     def test_table_exists_action_est_omise_en_simulation(self):
         """Data Pump refuse l'option en mode `SQLFILE`.
@@ -1059,6 +1116,64 @@ class TestInterpretation(unittest.TestCase):
         # Le fait reste visible : une note de confidentialite ne doit
         # ni faire echouer le run, ni disparaitre du rapport.
         self.assertIn("ORA-39173", str(resultat.warnings))
+
+    def test_les_codes_benins_ne_touchent_pas_la_liste_toleree(self):
+        resultat = self._interpret(
+            rc=5, tool="impdp",
+            kv={"OSD_ERROR_CODES": "ORA-39173"},
+            stderr="ORA-39173: chiffre en clair",
+        )
+        self.assertEqual(resultat.failed_constraints, [])
+
+    def test_les_contraintes_referentielles_sont_nommees(self):
+        """L'import reussi *partiellement* nomme ce qu'il n'a pas cree.
+
+        Le couple `ORA-39083` + `REF_CONSTRAINT` suffit a extraire
+        `<schema>.<contrainte>`, et le jeton `REF_CONSTRAINT` n'etant pas
+        traduit, la lecture tient sur un serveur francais.
+        """
+        resultat = self._interpret(
+            rc=5, tool="impdp",
+            kv={"OSD_ERROR_CODES": "ORA-02298 ORA-39083"},
+            stderr=(
+                "  [datapump] ORA-39083: Object type "
+                'REF_CONSTRAINT:"HR"."JHIST_DEPT_FK" failed to create with error:\n'
+                "  [datapump] ORA-02298: cannot validate (HR.JHIST_DEPT_FK) - "
+                "parent keys not found\n"
+                "  [datapump] ORA-39083: Object type "
+                'REF_CONSTRAINT:"HR"."JHIST_EMP_FK" failed to create with error:\n'
+            ),
+        )
+        self.assertEqual(
+            resultat.failed_constraints,
+            ["HR.JHIST_DEPT_FK", "HR.JHIST_EMP_FK"],
+        )
+
+    def test_une_contrainte_repetee_n_est_nommee_qu_une_fois(self):
+        """Une meme FK peut apparaitre a plusieurs endroits de la sortie."""
+        resultat = self._interpret(
+            rc=5, tool="impdp",
+            kv={"OSD_ERROR_CODES": "ORA-02298 ORA-39083"},
+            stderr=(
+                'REF_CONSTRAINT:"HR"."FK1" failed\n'
+                'ORA-02298: cannot validate (HR.FK1)\n'
+                'REF_CONSTRAINT:"HR"."FK1" failed again\n'
+            ),
+        )
+        self.assertEqual(resultat.failed_constraints, ["HR.FK1"])
+
+    def test_sans_code_tolere_aucune_contrainte_n_est_lue(self):
+        """Le motif n'est cherche que lorsque les codes le justifient.
+
+        Un `REF_CONSTRAINT` isole dans une sortie sans `ORA-39083`/`02298`
+        n'est pas un echec d'import, et ne doit pas etre presente comme tel.
+        """
+        resultat = self._interpret(
+            rc=5, tool="impdp",
+            kv={"OSD_ERROR_CODES": "ORA-00942"},
+            stderr='REF_CONSTRAINT:"HR"."FK1" hors sujet',
+        )
+        self.assertEqual(resultat.failed_constraints, [])
 
     def test_un_code_sans_gravite_n_efface_pas_une_vraie_erreur(self):
         """Le filtrage porte sur chaque code, pas sur la sortie entiere.

@@ -21,6 +21,7 @@ from support import FakeAdapter, FakeRunner
 from osd import exit_codes as ec
 from osd.checks import preflight
 from osd.checks.preflight import FAIL, OK, SKIP, WARN
+from osd.checks.table_filter import TableFilterPlan
 from osd.errors import ConnectionError_, OsdError, PrereqError
 
 MO = 1024 * 1024
@@ -803,6 +804,113 @@ class TestRendu(unittest.TestCase):
         self.assertEqual(d["code"], ec.PREREQ)
         self.assertIn("detail", d)
         self.assertIn("hint", d)
+
+
+class TestFiltrageDesTables(unittest.TestCase):
+    """Le controle du plan resolu a l'etape 6.
+
+    Aucun de ces verdicts n'est `FAIL` : le filtrage ne peut pas rendre
+    un run impossible, il ne peut que le rendre different de ce que la
+    configuration demandait. La distinction est celle, en pratique, du
+    code 2 (prerequis) applique a une configuration qu'on peut corriger
+    sans toucher a la base.
+    """
+
+    def test_sans_filtre_il_n_y_a_aucun_controle(self):
+        """Un controle permanent qui repond « aucun filtre » n'en est pas un.
+
+        Le rapport compte les controles : en ajouter un qui ne dit rien
+        dans le cas courant — c'est-a-dire dans tous les runs sans
+        filtrage — deforme la lecture sans apporter d'information.
+        """
+        self.assertIsNone(
+            preflight.check_table_filter(TableFilterPlan(schema="SRC"))
+        )
+
+    def test_un_filtre_entierement_resolu_est_un_controle_reussi(self):
+        r = preflight.check_table_filter(
+            TableFilterPlan(schema="SRC", excluded=["EMPLOYEES"],
+                            data_only=["REGIONS"])
+        )
+        self.assertEqual(r.status, OK)
+        self.assertEqual(r.code, ec.SUCCESS)
+        self.assertIn("1 table(s) hors duplication", r.message)
+        self.assertIn("1 sans donnee(s)", r.message)
+        self.assertFalse(r.failed)
+
+    def test_une_entree_sans_correspondance_est_un_avertissement(self):
+        """L'avertissement nomme l'entree, et dit quoi en faire.
+
+        Refuser le run serait rendre un changement de nom inobservable :
+        la table renommee ne correspond plus, le run est refuse, donc
+        jamais execute, donc jamais l'occasion de voir le message en
+        contexte. Corriger le nom ou retirer l'entree — les deux
+        s'appliquent, et le remede le dit.
+        """
+        r = preflight.check_table_filter(
+            TableFilterPlan(schema="SRC", excluded=["EMPLOYEES"],
+                            unmatched=["EXCLUDE_TABLES=EMPLOYES"])
+        )
+        self.assertEqual(r.status, WARN)
+        self.assertEqual(r.code, ec.PREREQ)
+        self.assertTrue(any("EXCLUDE_TABLES=EMPLOYES" in d
+                            for d in r.detail))
+        self.assertIn("Corriger le nom", r.hint)
+        self.assertIn("retirer l'entree", r.hint)
+
+    def test_un_filtre_qui_ne_designe_rien_alerte_quand_meme(self):
+        """Le cas ou se taire serait le plus grave.
+
+        Une seule entree, mal nommee : le plan est inactif, aucune table
+        filtree, et le schema part **entier**. Un controle qui se
+        declare « sans objet » parce que rien n'a ete designe dirait le
+        contraire de ce qui se passe — et c'est le seul moment ou
+        l'exploitant a besoin d'un signale.
+        """
+        plan = TableFilterPlan(schema="SRC",
+                               unmatched=["EXCLUDE_TABLES=NEXISTE_PAS"])
+        r = preflight.check_table_filter(plan)
+        self.assertIsNotNone(r)
+        self.assertEqual(r.status, WARN)
+        self.assertIn("aucune table designee", r.message)
+        self.assertIn("NEXISTE_PAS", r.detail[0])
+
+    def test_le_chevauchement_est_signale_sans_etre_un_echec(self):
+        r = preflight.check_table_filter(
+            TableFilterPlan(schema="SRC", excluded=["REGIONS"],
+                            overlap=["REGIONS"])
+        )
+        self.assertEqual(r.status, WARN)
+        self.assertTrue(any("exclusion totale appliquee" in d
+                            for d in r.detail))
+        self.assertIn("hors duplication", r.hint)
+
+    def test_une_liste_longue_est_comptee_et_non_tronquee_sans_le_dire(self):
+        """Le depassement est annonce : « (+2) » dit qu'il y en a plus.
+
+        Une liste coupee en silence se lit comme la liste complete, et
+        l'exploitant conclut alors que deux tables sur dix sont filtrees.
+        """
+        noms = [f"T{i:02d}" for i in range(10)]
+        r = preflight.check_table_filter(TableFilterPlan(schema="SRC",
+                                                         excluded=noms))
+        detail = " ".join(r.detail)
+        self.assertIn("(+2)", detail)
+        self.assertIn("T07", detail)
+        self.assertNotIn("T08", detail)
+        self.assertNotIn("T09", detail)
+
+    def test_le_plan_fait_partie_du_controle(self):
+        """Le rapport machine doit pouvoir afficher le plan resolu.
+
+        `data["plan"]` est ce que `--json` publie : sans lui, la forme
+        textuelle du controle parle de « 3 tables » sans jamais dire
+        lesquelles, et le diagnostic passe par le journal de l'etape 11.
+        """
+        plan = TableFilterPlan(schema="SRC", excluded=["A", "B"])
+        r = preflight.check_table_filter(plan)
+        self.assertEqual(r.data["plan"]["excluded"], ["A", "B"])
+        self.assertEqual(r.data["plan"]["schema"], "SRC")
 
 
 if __name__ == "__main__":

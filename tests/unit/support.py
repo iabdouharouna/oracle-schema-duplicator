@@ -15,6 +15,7 @@ la connectivite d'un serveur.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -178,8 +179,22 @@ class FakeAdapter:
         self.queries.append(f"schema_exists {schema}")
         return bool(self._get("schema_exists", True))
 
-    def schema_segment_bytes(self, schema: str, *, content: str = "ALL") -> int:
+    def schema_segment_bytes(
+        self,
+        schema: str,
+        *,
+        content: str = "ALL",
+        segment_signatures: Sequence[str] = (),
+        object_signatures: Sequence[str] = (),
+    ) -> int:
         self.queries.append(f"schema_segment_bytes {schema} {content}")
+        # Les deux listes viennent du plan de filtrage de l'etape 6. On
+        # les compte ici : un test qui verifie que le filtre arrive bien
+        # jusqu'a l'estimation le peut sans reconstruire le plan.
+        if segment_signatures:
+            self.queries.append(f"segment_signatures {len(segment_signatures)}")
+        if object_signatures:
+            self.queries.append(f"object_signatures {len(object_signatures)}")
         return int(self._get("schema_segment_bytes", 0))
 
     def directory_path(self, name: str) -> str:
@@ -195,6 +210,98 @@ class FakeAdapter:
 
     def label(self) -> str:
         return "fake"
+
+
+# --------------------------------------------------------------------------
+# Adaptateur « filtrage de tables »
+# --------------------------------------------------------------------------
+
+#: Premier groupe `IN (...)` d'une requete, hors `NOT IN`. C'est la
+#: liste que le code teste y place, et la seule que le faux doit lire.
+_IN_GROUPE = re.compile(r"(?<!not )\bin \(([^)]*)\)", re.IGNORECASE)
+_LITTERAL = re.compile(r"'((?:[^']|'')*)'")
+
+
+def noms_designes(sql: str) -> List[str]:
+    """Noms cites dans le premier `IN (...)` d'une requete.
+
+    Les trois interrogations du plan placent leur cible dans ce
+    premier groupe : les tables fermees pour la cascade, les references
+    pour les dependants, les objets pour les signatures. Oracle resout
+    la requete ainsi ; un faux qui repondrait sans la lire verifierait
+    qu'une liste est bien partie, jamais que c'est la bonne.
+
+    `not in` est ecarte par construction : `object_type not in
+    ('SYNONYM', 'DATABASE LINK')` precede toujours la liste voulue, et
+    la lire rendrait une liste de **types** pour une liste de noms —
+    deux listes de chaines, sans autre difference visible.
+    """
+    groupe = _IN_GROUPE.search(sql)
+    if groupe is None:
+        return []
+    return [lit.replace("''", "'") for lit in _LITTERAL.findall(groupe.group(1))]
+
+
+class SourceFiltre(FakeAdapter):
+    """Schema source dont les requetes du filtre sont resolues comme
+    Oracle les resoudrait.
+
+    `FakeAdapter` indexe ses reponses par sous-chaine de requete, et le
+    filtrage le met en defaut : `_owned_names` est appele deux fois —
+    une par mode — et ses deux requetes ne different que par la liste
+    `IN`. Choisir la cle revient alors a memoriser l'ordre de tri de
+    cette liste, c'est-a-dire a tester le faux plutot que le code.
+
+    Le routage se fait donc sur le contenu de la requete, et la liste
+    `IN` est lue. Le reste (inventaire, privileges, etat des jobs)
+    retombe sur le mecanisme habituel : un faux qui repondrait a tout
+    depuis son propre catalogue repondrait mal aux etapes qu'il ne
+    teste pas — notamment l'etape 16, qui compare deux inventaires.
+
+    Donnees attendues, toutes facultatives :
+
+    * `tables` — les tables du schema ;
+    * `possedes` — table -> objets qui partent avec elle (la table
+      comprise) : la cascade reelle de `EXCLUDE=TABLE` ;
+    * `dependants` — objet -> objets qui le referencent ;
+    * `signatures` — paires `[type, nom]`, ordonnees comme la requete
+      les rend, et source unique des signatures `TYPE~NOM`.
+    """
+
+    def query(self, sql: str) -> List[List[str]]:
+        reponse = self._reponse_filtre(sql)
+        if reponse is not None:
+            self.queries.append(sql)
+            return reponse
+        return super().query(sql)
+
+    def _reponse_filtre(self, sql: str) -> Optional[List[List[str]]]:
+        bas = " ".join(sql.lower().split())
+
+        if "from dba_dependencies" in bas:
+            table: Dict[str, List[str]] = self._get("dependants", {})
+            return [[d] for nom in noms_designes(sql)
+                    for d in table.get(nom, [])]
+
+        if "select index_name from dba_indexes" in bas:
+            possedes: Dict[str, List[str]] = self._get("possedes", {})
+            vus: List[str] = []
+            for nom in noms_designes(sql):
+                for objet in possedes.get(nom, []):
+                    if objet not in vus:
+                        vus.append(objet)
+            return [[objet] for objet in vus]
+
+        if ("select object_type, object_name from dba_objects" in bas
+                and "object_name in (" in bas):
+            noms = set(noms_designes(sql))
+            return [list(sig) for sig in self._get("signatures", [])
+                    if len(sig) > 1 and sig[1] in noms]
+
+        if "object_name not like 'bin$%'" in bas:
+            return [[nom] for nom in self._get("tables", [])]
+
+        return None
 
 
 # --------------------------------------------------------------------------

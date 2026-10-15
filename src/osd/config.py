@@ -162,6 +162,42 @@ def _schema() -> Dict[str, Spec]:
         "REMAP_TABLESPACE": Spec("csv", "", doc="Ex SRC_TS:DST_TS,SRC2:DST2."),
         "EXCLUDE": Spec("csv", "", doc="Ex TABLE:DEPT,VIEW:HR.V_TEST"),
         "INCLUDE": Spec("csv", "", doc="Ex TABLE:DEPT"),
+        # -- Filtrage des tables ----------------------------------------
+        # Deux modes qui ne disent pas la meme chose, et la distinction
+        # est celle de l'intention de l'exploitant :
+        #
+        #   * `EXCLUDE_TABLES` : la table ne part **pas du tout**. Ni DDL
+        #     ni donnees : elle n'existera pas sur la cible, et l'etape
+        #     16 l'ignore dans la comparaison.
+        #   * `EXCLUDE_TABLES_DATA` : la structure part, les lignes non.
+        #     La table existe sur la cible, vide.
+        #
+        # Le filtre n'agit que sur l'**export** (et sur l'exclusion
+        # rejetee a l'import, pour que la relecture du dump de l'etape 12
+        # decribe exactement l'import). Il ne supprime rien de ce qui
+        # existe deja sur la cible : une suppression serait une operation
+        # destructive, qui exige une option explicite.
+        "EXCLUDE_TABLES": Spec(
+            "csv", "",
+            doc="Tables non dupliquees, ni structure ni donnees "
+                "(EXCLUDE=TABLE). Noms exacts, insensibles a la casse. "
+                "Ex EMPLOYEES,JOB_HISTORY_TMP.",
+        ),
+        "EXCLUDE_TABLES_REGEX": Spec(
+            "csv", "",
+            doc="Meme chose, en expressions regulieres Python "
+                "insensibles a la casse. Ex ^LOG_[0-9]{2}_,SAL_.*_HIST.",
+        ),
+        "EXCLUDE_TABLES_DATA": Spec(
+            "csv", "",
+            doc="Tables exportees sans leurs donnees : structure "
+                "presente, vide sur la cible. Noms exacts.",
+        ),
+        "EXCLUDE_TABLES_DATA_REGEX": Spec(
+            "csv", "",
+            doc="Meme chose, en expressions regulieres Python "
+                "insensibles a la casse.",
+        ),
         # -- Securite et gardes-fous -------------------------------------
         "ALLOW_EXISTING_TARGET": Spec(
             "bool", False, doc="Refuse par defaut d'ecraser un schema cible existant."
@@ -569,6 +605,62 @@ def validate(cfg: Config, *, warnings: Optional[List[str]] = None) -> None:
         raise ConfigError(
             "COMPRESSION=METADATA_ONLY est incoherent avec CONTENT=DATA_ONLY",
             hint="Utiliser COMPRESSION=ALL ou DATA_ONLY.",
+        )
+
+    # -- Filtrage des tables : syntaxe des expressions regulieres --------
+    # Un motif mal forme est une faute de syntaxe : il est refuse ici, au
+    # chargement, et non a l'etape 6 -- la ou l'absence de correspondance,
+    # elle, n'est qu'un avertissement. La distinction est nette : un nom
+    # de table peut changer entre deux runs (un avertissement est alors
+    # le juste retour), un motif mal forme ne le deviendra jamais.
+    for cle in ("EXCLUDE_TABLES_REGEX", "EXCLUDE_TABLES_DATA_REGEX"):
+        for motif in values.get(cle) or []:
+            try:
+                re.compile(motif, re.IGNORECASE)
+            except re.error as exc:
+                raise ConfigError(
+                    f"{cle} : expression reguliere invalide {motif!r} "
+                    f"({exc.msg})",
+                    hint="Syntaxe `re` Python : alternance `|`, bornes "
+                         "{n,m}, ancres `^` et `$`. Attention aux "
+                         "caracteres que la configuration refuse par "
+                         "ailleurs : `;`, `<`, `>`, `&&` et les doubles "
+                         "antislashs.",
+                ) from None
+
+    # `CONTENT=METADATA_ONLY` n'exporte aucune ligne : le mode « structure
+    # sans donnees » n'a alors rien a retirer. L'option est acceptee --
+    # elle n'est pas fausse -- mais signaler son silence vaut mieux que de
+    # laisser croire a un filtrage actif.
+    if values["CONTENT"] == "METADATA_ONLY" and (
+            values.get("EXCLUDE_TABLES_DATA")
+            or values.get("EXCLUDE_TABLES_DATA_REGEX")):
+        warnings.append(
+            "EXCLUDE_TABLES_DATA sans effet : CONTENT=METADATA_ONLY "
+            "n'exporte deja aucune donnee"
+        )
+
+    # -- `INCLUDE` et `EXCLUDE` sont incompatibles sur une 19c -----------
+    # Refus du client lui-meme, observe sur une base reelle : `include=TABLE`
+    # seul reussit, ajoute a un seul `exclude=` il echoue en
+    # `UDE-00011: parameter include is incompatible with parameter exclude`.
+    # Refuse ici plutot que laisse echouer l'export, qui est la premiere
+    # etape a produire un fichier : la cause n'aurait rien a voir avec le
+    # dump, et rien dans le journal n'aurait designe ce fichier.
+    #
+    # Le mode B est epargne : `EXCLUDE_TABLES_DATA*` pose un `query=`,
+    # qui se cumule sans probleme a `INCLUDE` (verifie aussi).
+    if values.get("INCLUDE") and any(
+            values.get(cle)
+            for cle in ("EXCLUDE", "EXCLUDE_TABLES", "EXCLUDE_TABLES_REGEX")):
+        raise ConfigError(
+            "INCLUDE est incompatible avec EXCLUDE et avec le filtrage "
+            "des tables (UDE-00011)",
+            hint="Sur une 19c, `include=` et `exclude=` ne peuvent pas "
+                 "coexister dans un meme parfile (UDE-00011, mesure sur "
+                 "une base reelle). Retirer INCLUDE, ou retirer EXCLUDE "
+                 "et EXCLUDE_TABLES* si c'est l'inclusion qui doit "
+                 "primer.",
         )
 
     # -- Securite : le mot de passe en clair n'est accepte qu'en repli ----

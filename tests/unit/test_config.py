@@ -608,6 +608,121 @@ class TestTopologieMixte(unittest.TestCase):
                 support.load_config(SSH_KEY=str(key))
 
 
+class TestFiltrageDesTables(unittest.TestCase):
+    """Les quatre cles `EXCLUDE_TABLES*`, et leurs gardes au chargement.
+
+    Tout ce qui est decidable ici l'est ici : une faute de configuration
+    doit echouer avant toute connexion, et surtout avant le transfert
+    d'un dump. Une erreur signalee apres l'export a un tout autre
+    remede — souvent « relancer » — la ou une erreur de configuration
+    en a un seul : corriger la ligne.
+    """
+
+    def test_les_cles_sont_des_listes_et_non_des_chaines(self):
+        """Une chaine non declaree ferait iterer le plan sur ses caracteres.
+
+        Le defaut d'une cle `csv` est `[]`, pas `""` : `for nom in
+        config` sur une chaine designerait une lettre de table par
+        entree, et chaque lettre deviendrait un avertissement de nom
+        introuvable.
+        """
+        cfg = support.load_config(
+            EXCLUDE_TABLES="EMPLOYEES, JOB_HISTORY_TMP",
+            EXCLUDE_TABLES_DATA="REGIONS",
+        )
+        self.assertEqual(cfg.get("EXCLUDE_TABLES"),
+                         ["EMPLOYEES", "JOB_HISTORY_TMP"])
+        self.assertEqual(cfg.get("EXCLUDE_TABLES_DATA"), ["REGIONS"])
+        self.assertEqual(cfg.get("EXCLUDE_TABLES_REGEX"), [])
+        self.assertEqual(cfg.get("EXCLUDE_TABLES_DATA_REGEX"), [])
+
+    def test_une_regex_mal_formee_est_refusee_au_chargement(self):
+        """Le motif est refuse ici, ou aucun travail n'a encore ete fait.
+
+        Un motif errone detecte a l'etape 6 survit a la connexion, aux
+        controles, au transfert des droits — puis echoue au moment ou
+        l'erreur se paie le plus cher. La syntaxe, elle, ne change pas
+        d'une base a l'autre : elle se tranche sans base.
+        """
+        for cle in ("EXCLUDE_TABLES_REGEX", "EXCLUDE_TABLES_DATA_REGEX"):
+            with self.subTest(cle=cle):
+                with self.assertRaises(ConfigError) as ctx:
+                    support.load_config(**{cle: "[A-Z"})
+                self.assertIn(cle, str(ctx.exception))
+
+    def test_une_regex_valide_est_conservee_telle_quelle(self):
+        """Le motif n'est pas interprete au chargement, seulement lu.
+
+        Le cas est tranche a l'execution, contre les noms reels : le
+        charger tel quel evite qu'une forme supportee par `re` soit
+        deformee avant d'atteindre la compilation.
+        """
+        cfg = support.load_config(EXCLUDE_TABLES_REGEX="^TMP_, LOG_.*_HIST")
+        self.assertEqual(cfg.get("EXCLUDE_TABLES_REGEX"),
+                         ["^TMP_", "LOG_.*_HIST"])
+
+    def test_metadata_only_rend_le_mode_sans_donnees_sans_effet(self):
+        """Aucune ligne n'est exportee : il n'y a rien a retirer.
+
+        L'option reste acceptee — elle n'est pas fausse — mais garder en
+        silence une cle qui ne fait rien fait croire a un filtrage
+        actif. L'avertissement porte le nom de la cle pour qu'on la
+        retrouve.
+        """
+        cfg = support.load_config(CONTENT="METADATA_ONLY",
+                                  EXCLUDE_TABLES_DATA="REGIONS")
+        self.assertTrue(
+            any("EXCLUDE_TABLES_DATA" in w and "sans effet" in w
+                for w in cfg.warnings)
+        )
+
+    def test_include_est_incompatible_avec_lexclusion(self):
+        """`UDE-00011`, mesure sur une 19c reelle.
+
+        Data Pump refuse les deux dans un meme parfile. Le refus est
+        porte ici, avec le code d'erreur du client, parce que le message
+        du client n'apparaitrait qu'au moment de l'export — le seul
+        endroit ou la correction n'est plus une ligne de configuration
+        mais une reexecution.
+        """
+        with self.assertRaises(ConfigError) as ctx:
+            support.load_config(INCLUDE="TABLE:DEPT",
+                                EXCLUDE="VIEW:HR.V_TEST")
+        self.assertIn("UDE-00011", str(ctx.exception))
+
+    def test_include_est_incompatible_avec_le_filtre_de_tables(self):
+        """Le mode A produit bien un `exclude=`, donc le meme refus."""
+        for cle, valeur in (("EXCLUDE_TABLES", "EMPLOYEES"),
+                            ("EXCLUDE_TABLES_REGEX", "^TMP_")):
+            with self.subTest(cle=cle):
+                with self.assertRaises(ConfigError) as ctx:
+                    support.load_config(INCLUDE="TABLE:DEPT",
+                                        **{cle: valeur})
+                self.assertIn("UDE-00011", str(ctx.exception))
+
+    def test_le_mode_sans_donnees_se_cumule_a_include(self):
+        """Le mode B pose un `query=`, qui n'est pas un `exclude=`.
+
+        Refuser la combinaison aurait empeche une lecture pourtant
+        valide — verifiee : `include=TABLE` plus `query=` exporte bien,
+        et la structure seule arrive alors avec le filtre desire.
+        """
+        cfg = support.load_config(INCLUDE="TABLE:DEPT",
+                                  EXCLUDE_TABLES_DATA="REGIONS")
+        self.assertEqual(cfg.get("INCLUDE"), ["TABLE:DEPT"])
+        self.assertEqual(cfg.get("EXCLUDE_TABLES_DATA"), ["REGIONS"])
+
+    def test_include_seul_reste_accepte(self):
+        """`include=TABLE` seul n'a jamais ete en cause.
+
+        Le garde porte sur la **combinaison** : le tester uniquement en
+        presence d'`EXCLUDE` laisserait passer un refus qui, lui, vient
+        bien du client.
+        """
+        cfg = support.load_config(INCLUDE='TABLE:"EMPLOYEES"')
+        self.assertEqual(cfg.get("INCLUDE"), ['TABLE:"EMPLOYEES"'])
+
+
 class TestFichierExemple(unittest.TestCase):
     """Le fichier d'exemple livre doit etre chargeable tel quel.
 

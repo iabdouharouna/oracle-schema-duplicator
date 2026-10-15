@@ -124,7 +124,9 @@ def _safe_options(cfg) -> Dict[str, Any]:
     """
     published = [
         "CONTENT", "COMPRESSION", "PARALLEL", "REMAP_TABLESPACE",
-        "EXCLUDE", "INCLUDE", "TABLE_EXISTS_ACTION", "VALIDATION_LEVEL",
+        "EXCLUDE", "INCLUDE", "EXCLUDE_TABLES", "EXCLUDE_TABLES_REGEX",
+        "EXCLUDE_TABLES_DATA", "EXCLUDE_TABLES_DATA_REGEX",
+        "TABLE_EXISTS_ACTION", "VALIDATION_LEVEL",
         "ALLOW_EXISTING_TARGET", "TRANSFER_MODE",
     ]
     out: Dict[str, Any] = {}
@@ -286,11 +288,56 @@ def _artifact_lines(artifacts: Dict[str, Any]) -> List[str]:
                             f"             {part.get('name', '?')}  "
                             f"{human(int(part.get('bytes', 0)))}"
                         )
+        elif key == "table_filter" and isinstance(value, dict):
+            # Le plan complet est dans le JSON du rapport ; le texte ne
+            # retient que ce qui a change quelque chose. Un filtre vide
+            # (le cas par defaut) n'a pas sa ligne : un rapport qui
+            # rappelle partout l'absence d'options inutilisees se lit mal.
+            exclues = value.get("excluded") or []
+            vides = value.get("data_only") or []
+            if not exclues and not vides:
+                continue
+            entete = (
+                f"{len(exclues)} table(s) hors duplication, "
+                f"{len(vides)} sans donnee(s)"
+            )
+            if value.get("dependents"):
+                entete += f", {len(value['dependents'])} dependant(s) retire(s)"
+            lines.append(f"{key:<11}: {redact(entete)}")
+            for etiquette, noms in (
+                ("hors duplication", exclues),
+                ("sans donnees", vides),
+                ("dependants", value.get("dependents") or []),
+                ("presente(s) dans les deux listes", value.get("overlap") or []),
+                ("sans effet", value.get("unmatched") or []),
+            ):
+                if noms:
+                    lines.append(
+                        f"             {etiquette} : {redact(_bref(noms))}"
+                    )
+            if value.get("ignored"):
+                lines.append(
+                    f"             retire(s) de la comparaison : "
+                    f"{len(value['ignored'])} objet(s)"
+                )
         elif isinstance(value, (int, float)):
             lines.append(f"{key:<11}: {value}")
         else:
             lines.append(f"{key:<11}: {redact(str(value))}")
     return lines
+
+
+def _bref(noms: Sequence[str], limite: int = 6) -> str:
+    """Enumere une liste en restant lisible sur un terminal.
+
+    Le depassement est annonce plutot que tronque en silence : « (+N) »
+    dit qu'il y en a davantage, sans faire croire que la liste s'arrete
+    la.
+    """
+    if len(noms) <= limite:
+        return ", ".join(str(n) for n in noms)
+    reste = len(noms) - limite
+    return ", ".join(str(n) for n in noms[:limite]) + f" (+{reste})"
 
 
 # --------------------------------------------------------------------------

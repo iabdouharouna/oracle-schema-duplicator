@@ -67,6 +67,31 @@ DATAPUMP_WARNING_CODES = frozenset({2, 4, 8})
 #: l'effacer non plus.
 DATAPUMP_BENIGN_CODES = frozenset({"ORA-39173"})
 
+#: Codes qui signalent, a l'import, une contrainte referentielle que la
+#: cible ne peut pas valider **parce que le mode B a exclu les donnees de
+#: sa table parente**.
+#:
+#: Le mode B (`EXCLUDE_TABLES_DATA`) exporte la structure d'une table mais
+#: pas ses lignes. Une table enfant qui, elle, garde ses donnees pointe
+#: alors vers des cles parentes absentes : `impdp` cree la table enfant et
+#: ses lignes, puis ne peut pas *valider* la FK -- `ORA-02298: cannot
+#: validate (<schema>.<contrainte>) - parent keys not found`, enveloppe
+#: par `ORA-39083` (« object type ... failed to create »).
+#:
+#: Ce n'est ni un defaut du dump ni une erreur de l'outil : c'est la
+#: consequence **attendue** d'une exclusion de donnees portant sur une
+#: table parente. L'outil ne fait donc pas echouer le run sur ces deux
+#: codes seuls, en mode B ; il rapporte les contraintes restees non
+#: creees. Mesure sur une 19c reelle, schema `HR` : `JOB_HISTORY` (11
+#: lignes) vers `EMPLOYEES` et `DEPARTMENTS` (0 ligne), import `rc=5`,
+#: `2 error(s)`, job `COMPLETED`.
+#:
+#: La tolerance est **conditionnee** : mode B actif, et *tous* les codes
+#: d'erreur dans cet ensemble. Un seul code hors liste rend la main au
+#: chemin d'echec ordinaire -- un `ORA-00942` ou un `ORA-31684` reste un
+#: echec, ici comme ailleurs.
+DATAPUMP_IMPORT_REF_TOLERATED = frozenset({"ORA-02298", "ORA-39083"})
+
 #: Etats de `DBA_DATAPUMP_JOBS.STATE` qui signifient « le travail est
 #: fini ». Volontairement unique : tous les autres etats — `RUNNING`,
 #: `EXECUTING`, `STOPPING`, `FAILED`, `NEEDS_COMMIT` — signifient que le
@@ -137,6 +162,18 @@ EXCLUDE_A_IMPORT = ("USER",)
 
 _ERROR_RE = re.compile(r"(?:ORA|UDI|DBMGSPC)-\d+")
 
+#: Contrainte referentielle nommee par un echec d'import.
+#:
+#: Data Pump ecrit `ORA-39083: Object type REF_CONSTRAINT:"<schema>"."<nom>"
+#: failed to create`, puis, a la ligne suivante, le code sous-jacent
+#: (`ORA-02298` pour une FK). Le jeton `REF_CONSTRAINT` n'est **pas**
+#: traduit -- contrairement au texte du message -- et les noms sont
+#: quotes ; le motif reste donc independant de la langue du serveur.
+_REF_CONSTRAINT_RE = re.compile(
+    r'REF_CONSTRAINT\s*:\s*"([^"]+)"\s*\.\s*"([^"]+)"',
+    re.IGNORECASE,
+)
+
 #: Timeout de l'etape de verification SQLFILE. La relecture du dump est
 #: proportionnelle a sa taille ; 1 h par defaut laisse le temps a un
 #: schema de plusieurs giga-octets sans bloquer indefiniment.
@@ -167,6 +204,11 @@ class DataPumpResult:
     parts: List[DumpPart] = field(default_factory=list)
     error_codes: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    #: Contraintes referentielles que l'import n'a pas pu creer, sous la
+    #: forme `<schema>.<nom>`. Renseigne a partir de la sortie d'`impdp`
+    #: (`ORA-39083` + `REF_CONSTRAINT`), pas devine : une liste vide ne
+    #: veut pas dire « aucune », elle veut dire « rien de nomme ».
+    failed_constraints: List[str] = field(default_factory=list)
     job_status: str = ""
     parfile: str = ""
     #: L'operation a-t-elle ete simulee plutot qu'executee ?
@@ -226,6 +268,7 @@ class DataPumpAdapter:
         remap_tablespace: Sequence[str] = (),
         exclude: Sequence[str] = (),
         include: Sequence[str] = (),
+        query: Sequence[str] = (),
         reuse: bool = True,
     ) -> List[str]:
         """Retourne les lignes du parfile d'export.
@@ -234,6 +277,24 @@ class DataPumpAdapter:
         Le parfile n'est jamais genere depuis une chaine concatenee puis
         evaluee : chaque valeur est ecrite entre quotes, ce qui la rend
         litterale pour Data Pump.
+
+        Chaque `EXCLUDE` et chaque `INCLUDE` a **sa propre ligne**. Le
+        separateur `;` n'existe pas : `exclude=USER;TABLE:"IN ('T')"` est
+        rejete en 19c par `ORA-39038`, qui lit l'ensemble comme un type
+        d'objet `USER;TABLE` inexistant. La forme documentee — une ligne
+        par parametre, accumulees — est celle qui fonctionne, verifiee
+        avec un export reel sur `HR` (deux filtres, `EMPLOYEES` absente
+        du DDL relu par `SQLFILE`).
+
+        `query` est propre a l'export. Le dump ne contient deja plus les
+        lignes vides : les repeter a l'import ne ferait que rejeter ce
+        qui n'y est pas, et `QUERY` est de toute facon incompatible avec
+        `CONTENT=METADATA_ONLY`.
+
+        `INCLUDE` et `EXCLUDE` ne peuvent pas coexister sur une 19c
+        (`UDE-00011: parameter include is incompatible with parameter
+        exclude`) : la combinaison est refusee au chargement de la
+        configuration, et cette methode n'a pas a la tolerer.
         """
         lines: List[str] = [f'userid="{_userid(self.side)}"']
         lines.append(f"schemas={_q(schema.upper())}")
@@ -262,10 +323,18 @@ class DataPumpAdapter:
             lines.append(f"filesize={filesize_mb}")
         if remap_tablespace:
             lines.append("remap_tablespace=" + ",".join(remap_tablespace))
-        if include:
-            lines.append("include=" + ";".join(include))
-        if exclude:
-            lines.append("exclude=" + ";".join(exclude))
+        # Une ligne par filtre, jamais fusionnees : voir la docstring.
+        # Les elements vides sont ecartes — une ligne `exclude=` sans
+        # valeur est une erreur de syntaxe Data Pump, pas un filtre vide.
+        for item in include:
+            if str(item).strip():
+                lines.append(f"include={item}")
+        for item in exclude:
+            if str(item).strip():
+                lines.append(f"exclude={item}")
+        for item in query:
+            if str(item).strip():
+                lines.append(f"query={item}")
         if reuse:
             # Un run repris ne doit pas echouer sur un dump deja present.
             lines.append("reuse_dumpfiles=yes")
@@ -343,16 +412,19 @@ class DataPumpAdapter:
             lines.append(f"remap_schema={_q(source_schema.upper() + ':' + target_schema.upper())}")
             if remap_tablespace:
                 lines.append("remap_tablespace=" + ",".join(remap_tablespace))
-            if include:
-                lines.append("include=" + ";".join(include))
+            for item in include:
+                if str(item).strip():
+                    lines.append(f"include={item}")
         # `EXCLUDE` est pose dans les deux modes : il porte sur le jeu
         # d'objets **lus**, non sur ce qu'on en fait. La relecture doit
         # donc decrire exactement ce que l'import tentera, faute de quoi
         # la verification de l'etape 12 validerait un import auquel
         # elle n'a pas essaye de repondre.
-        excl = _exclude_import(exclude)
-        if excl:
-            lines.append("exclude=" + ";".join(excl))
+        #
+        # Une ligne par filtre, comme a l'export : le separateur `;`
+        # n'existe pas en 19c (`ORA-39038`).
+        for item in _exclude_import(exclude):
+            lines.append(f"exclude={item}")
         return lines
 
     # -- Execution --------------------------------------------------------
@@ -441,6 +513,15 @@ class DataPumpAdapter:
 
         dp_error = result.get("OSD_DATAPUMP_ERROR") == "1"
         out = DataPumpResult(rc=rc, job_name=job_name, error_codes=codes)
+
+        # Contraintes referentielles nommees par la sortie, lues dans le
+        # seul cas ou elles peuvent y figurer. Le `userid` et les donnees
+        # ne sont jamais concernes : le motif ne retient que le couple
+        # `REF_CONSTRAINT:"schema"."nom"`.
+        if any(code in DATAPUMP_IMPORT_REF_TOLERATED for code in codes):
+            out.failed_constraints = _ref_constraints(
+                result.stderr + "\n" + result.stdout_raw
+            )
 
         # Le `NullRunner` marque sa reponse. Aucun code n'ayant ete
         # consulte, aucune erreur ne peut etre constatee, et `rc` vaut 0
@@ -613,6 +694,22 @@ def _q(value: str) -> str:
     guillemet doit voir ce guillemet double, sinon la ligne est coupee.
     """
     return '"' + str(value).replace('"', '""') + '"'
+
+
+def _ref_constraints(texte: str) -> List[str]:
+    """Contraintes referentielles nommees dans une sortie Data Pump.
+
+    Retourne des `schema.nom` uniques, dans l'ordre d'apparition. La
+    fonction ne devine rien : seules les lignes `ORA-39083` nommant un
+    `REF_CONSTRAINT` sont lues. Une chaine vide rend une liste vide, ce
+    qui distingue « rien de nomme » de « aucune contrainte ».
+    """
+    out: List[str] = []
+    for schema, nom in _REF_CONSTRAINT_RE.findall(texte or ""):
+        plein = f"{schema}.{nom}"
+        if plein not in out:
+            out.append(plein)
+    return out
 
 
 def _exclude_import(exclude: Sequence[str]) -> List[str]:

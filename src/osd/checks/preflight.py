@@ -267,6 +267,112 @@ def check_source_schema(adapter, schema: str, *, content: str) -> CheckResult:
     )
 
 
+def check_table_filter(plan) -> Optional[CheckResult]:
+    """Rend compte du filtre de tables resolu a l'etape 6.
+
+    `None` quand aucun filtre n'est configure : un controle permanent
+    qui repond « aucun filtre » n'est pas un controle, c'est du bruit
+    dans un rapport que l'exploitant doit pouvoir lire d'un seul coup
+    d'oeil.
+
+    Le verdict n'est jamais `FAIL`. Une entree sans correspondance est un
+    **avertissement**, et non un refus, parce qu'une table peut changer de
+    nom entre deux runs : le refus rendrait ce changement inobservable,
+    en empechant precisement l'execution qui l'aurait fait apparaitre.
+    Le remede annonce est celui qui s'applique — corriger le nom ou
+    retirer l'entree — et rien d'autre.
+
+    Le cas limite est celui ou **aucune** entree ne correspond : le plan
+    est alors inactif, et c'est justement la ou se taire serait le plus
+    grave. Un filtre configure qui ne filtre rien laisse passer le schema
+    entier, sans que le rapport dise jamais que la cle n'a servi a rien ;
+    dire « aucun filtre » alors que la configuration en porte un serait
+    le meme mensonge a l'envers.
+    """
+    if not (plan.active or plan.unmatched):
+        return None
+
+    detail: List[str] = []
+    if plan.excluded:
+        detail.append(
+            _enum("hors duplication, structure et donnees", plan.excluded)
+        )
+    if plan.dependents:
+        detail.append(_enum("retires avec elles", plan.dependents, limite=6))
+    if plan.data_only:
+        detail.append(_enum("structure sans donnees", plan.data_only))
+    if plan.overlap:
+        detail.append(
+            _enum("dans les deux listes : exclusion totale appliquee",
+                  plan.overlap)
+        )
+    if plan.unmatched:
+        detail.append("sans correspondance : " + ", ".join(plan.unmatched))
+
+    if plan.active:
+        message = (
+            f"{len(plan.excluded)} table(s) hors duplication, "
+            f"{len(plan.data_only)} sans donnee(s)"
+        )
+        if plan.dependents:
+            message += f", {len(plan.dependents)} objet(s) dependant(s) retire(s)"
+    else:
+        # Filtre configure mais **sans effet** : aucune entree n'a
+        # designe de table. Annoncer « 0 table hors duplication » sans
+        # plus ferait passer une configuration qui ne filtre rien pour
+        # un filtre qui filtre bien.
+        message = f"aucune table designee, {len(plan.unmatched)} entree(s) sans effet"
+
+    indices: List[str] = []
+    if plan.unmatched:
+        indices.append(
+            "Les entrees sans correspondance ne filtrent rien : ces tables "
+            "partent donc integralement. Corriger le nom — les tables sont "
+            "en majuscules — ou retirer l'entree. Un motif n'est applique "
+            "que s'il designe au moins une table existante dans le schema "
+            "source."
+        )
+    if plan.overlap:
+        indices.append(
+            "Une table declaree a la fois hors duplication et sans donnees "
+            "n'a qu'une realite possible : hors duplication. Retirer l'une "
+            "des deux entrees pour que la configuration dise ce qu'elle "
+            "veut."
+        )
+    if indices:
+        return CheckResult(
+            name="filtrage des tables",
+            status=WARN,
+            code=ec.PREREQ,
+            message=(message + ", entree(s) sans effet")
+                    if plan.active else message,
+            detail=detail,
+            hint=" ".join(indices),
+            data={"plan": plan.to_dict()},
+        )
+    return CheckResult(
+        name="filtrage des tables",
+        status=OK,
+        message=message,
+        detail=detail,
+        data={"plan": plan.to_dict()},
+    )
+
+
+def _enum(label: str, items: Sequence[str], limite: int = 8) -> str:
+    """Enumere une liste en restant lisible sur un ecran.
+
+    Une liste de quarante noms dans un detail ne se lit pas : elle se
+    compte. Le depassement est donc annonce plutot que tronque en
+    silence — « (+32) » dit qu'il y en a davantage, sans faire croire
+    que la liste s'arrete la.
+    """
+    if len(items) <= limite:
+        return f"{label} : {', '.join(items)}"
+    reste = len(items) - limite
+    return f"{label} : {', '.join(items[:limite])} (+{reste})"
+
+
 def check_target_schema(
     adapter, schema: str, *, allow_existing: bool, can_create: bool = False
 ) -> CheckResult:

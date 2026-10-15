@@ -142,6 +142,67 @@ silencieusement une cible préparée à la main est le pire des deux mondes.
 **Si vous l'assumez, lisez quand même la suite** : `TABLE_EXISTS_ACTION=SKIP`
 ne couvre que les tables. Voir « `ORA-31684` » plus bas.
 
+## Filtrage des tables
+
+Quatre clés, deux modes — et ils ne disent pas la même chose.
+
+| Clés | Effet |
+|------|-------|
+| `EXCLUDE_TABLES`, `EXCLUDE_TABLES_REGEX` | la table ne part **pas du tout** : ni structure ni données |
+| `EXCLUDE_TABLES_DATA`, `EXCLUDE_TABLES_DATA_REGEX` | la structure part, les lignes non |
+
+Les listes portent des noms séparés par des virgules ; les deux clés `_REGEX`
+sont des motifs `re` Python, ignorés à la casse (`^TMP_` désigne toutes les
+tables commençant par `TMP_`).
+
+**Ce qui part avec une table du mode A.** Data Pump l'omet avec ses index,
+contraintes, grants et triggers. L'outil retire aussi les objets qui en
+dépendent — vues, procédures, packages — directement puis transitivement :
+créer une vue sur une table absente échouerait en `ORA-00942` à l'import, et
+une procédure ne se compile pas sans les tables qu'elle référence. Ce qui est
+retiré est listé à l'étape 6, jamais silencieux.
+
+**Entrée sans correspondance : avertissement, pas échec.** Une table peut
+changer de nom entre deux runs ; refuser le run sur ce signal empêcherait
+précisément l'exécution qui l'aurait fait apparaître. Le message nomme
+l'entrée et dit quoi corriger. Une regex **mal formée**, elle, est refusée au
+chargement de la configuration (code 1) — elle ne sera jamais juste.
+
+**Une table dans les deux listes.** L'exclusion totale l'emporte, et
+l'étape 6 le signale.
+
+**Mode B et intégrité référentielle.** Exclure les données d'une table
+**parente** alors qu'une de ses tables **enfants** garde les siennes produit
+une cible où les clés parentes manquent. `impdp` charge tout ce qu'il peut,
+puis ne peut pas *valider* les clés étrangères concernées :
+`ORA-02298: cannot validate (...FK...) - parent keys not found`, enveloppé
+par `ORA-39083`. C'est la conséquence **attendue** du mode B, pas un défaut
+du dump. L'outil ne fait donc pas échouer le run lorsque le mode B est actif
+et que **tous** les codes d'erreur de l'import appartiennent à
+`{ORA-02298, ORA-39083}` ; il rapporte les contraintes restées non créées
+dans un avertissement `contraintes referentielles` et poursuit. Un code
+étranger, ou un job d'import qui n'est pas `COMPLETED`, ramène l'échec
+ordinaire. Pour éviter le cas : exclure aussi les données des tables enfants,
+ou ne pas exclure celles des parents. Mesuré sur une 19c réelle (`HR` :
+`JOB_HISTORY`, 11 lignes, vers `EMPLOYEES` et `DEPARTMENTS`, 0 ligne).
+
+**`INCLUDE` est incompatible avec `EXCLUDE` et `EXCLUDE_TABLES*`** : la 19c
+refuse les deux dans le même parfile (`UDE-00011: parameter include is
+incompatible with parameter exclude`, mesuré sur une base réelle). La
+combinaison est refusée au chargement. `EXCLUDE_TABLES_DATA*` — un `query=` —
+n'est pas concerné et se cumule sans problème à `INCLUDE`.
+
+**Le plan est résolu à l'étape 6, contre le schéma source réel, puis figé
+dans l'état du run.** Un `resume` rejoue donc la même liste que l'export
+qu'il rejoue, même si le schéma a changé entre temps.
+
+**Le filtre ne supprime rien de ce qui existe déjà côté cible** : il décide
+de ce qui part, pas de ce qui reste.
+
+**`CONTENT=METADATA_ONLY`** : `EXCLUDE_TABLES_DATA*` n'a alors aucun effet —
+aucune ligne n'est exportée de toute façon. La combinaison est acceptée, avec
+un avertissement au chargement.
+
 ## Étape 8 — tablespaces et privilèges
 
 **Tablespace inexistant.** L'outil ne crée pas de tablespace. Vérifier

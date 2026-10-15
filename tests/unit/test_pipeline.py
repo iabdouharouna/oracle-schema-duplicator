@@ -39,6 +39,7 @@ import support  # noqa: F401
 
 from osd import exit_codes as ec
 from osd.adapters.null import NullRunner
+from osd.checks.table_filter import TableFilterPlan
 from osd.adapters.transfer import TransferBackend
 from osd.errors import (
     ConfigError,
@@ -2597,6 +2598,393 @@ class TestCreationDuSchemaCible(CasDeTest):
         s = self.scenario(only=[15], dry_run=True, cible=_cible_qui_apparait())
         self.assertEqual(s.aller(), ec.VALIDATION)
         self.assertEqual(s.statut(15), FAILED)
+
+
+class TestFiltrageDesTables(CasDeTest):
+    """Le filtre de tables, de l'etape 6 a l'etape 16.
+
+    Le filtre traverse cinq etapes qui n'ont aucun raison de concorder
+    d'elles-memes : la resolution (6), l'estimation d'espace (9), le
+    parfile d'export (11), le parfile d'import (14) et la comparaison
+    (16). Chacune recoit le plan **par une autre voie** qu'elle-meme —
+    l'etat, un artefact fige — donc chacune peut, sans erreur de calcul,
+    en voir un autre. Ce sont ces voies que ces tests observent.
+    """
+
+    #: Tables du faux schema source.
+    TABLES = ["DEPARTMENTS", "EMPLOYEES", "SAL_HISTORY"]
+
+    #: Ce qui part **avec** chaque table : la cascade de `EXCLUDE=TABLE`
+    #: (la table comprise — c'est elle qui est filtree).
+    POSSEDES = {
+        "EMPLOYEES": ["EMPLOYEES", "EMP_EMP_ID_PK"],
+        "SAL_HISTORY": ["SAL_HISTORY"],
+        "DEPARTMENTS": ["DEPARTMENTS"],
+    }
+
+    #: Une vue sur `EMPLOYEES` : elle part avec elle, par dependance.
+    DEPENDANTS = {"EMPLOYEES": ["V_EMP"], "V_EMP": []}
+
+    #: Inventaire, ordonne comme la requete le rend.
+    SIGNATURES = [
+        ["INDEX", "EMP_EMP_ID_PK"],
+        ["TABLE", "DEPARTMENTS"],
+        ["TABLE", "EMPLOYEES"],
+        ["TABLE", "SAL_HISTORY"],
+        ["VIEW", "V_EMP"],
+    ]
+
+    def source(self, **kw: Any):
+        """Source nominale, plus les donnees que le filtre interroge.
+
+        `_adaptateur_source()` repond aux requetes du pipeline ; celle-ci
+        repond aussi a celles du plan, par routage sur le contenu de la
+        requete (`SourceFiltre`). Les deux sont necessaires : le plan sans
+        le pipeline ne testerait qu'un bout de la chaine.
+        """
+        donnees = dict(
+            object_count=30, schema_exists=True,
+            schema_segment_bytes=8 * GIB,
+            directory_path="/donnees/source",
+            tablespaces_capacity={"USERS": {"free_bytes": 100 * GIB}},
+            responses=_reponses("EXP_FULL_DATABASE", "COMPLETED", "0", "EXPORT"),
+            tables=self.TABLES, possedes=self.POSSEDES,
+            dependants=self.DEPENDANTS, signatures=self.SIGNATURES,
+        )
+        donnees["responses"].update(kw.pop("responses", None) or {})
+        donnees.update(kw)
+        return support.SourceFiltre(**donnees)
+
+    def scripts(self, s: Scenario, cote: str = "source") -> str:
+        runner = s.source_runner if cote == "source" else s.target_runner
+        return "".join(runner.scripts_de("datapump")).lower()
+
+    def controles(self, s: Scenario, nom: str = "filtrage des tables"):
+        return [c for c in s.pipeline.checks if c.name == nom]
+
+    # -- Etape 6 : resolution --------------------------------------------
+
+    def test_l_etape_6_resout_le_filtre_et_le_figge(self):
+        """Le plan est ecrit dans l'etat, une fois, au point ou il est
+        connu.
+
+        Les etapes 9, 11, 14 et 16 n'ont aucune raison d'interroger la
+        source elles-memes : elles l'ont deja fait, une fois, contre le
+        schema reel. Figer l'artefact ici, c'est aussi — et surtout —
+        fixer ce qu'un `resume` rejouera.
+        """
+        s = self.nouveau(
+            config={"EXCLUDE_TABLES": "EMPLOYEES",
+                    "EXCLUDE_TABLES_DATA": "SAL_HISTORY"},
+            source=self.source(),
+        )
+        self.assertEqual(s.aller(), ec.SUCCESS)
+
+        plan = s.state.artifacts["table_filter"]
+        self.assertEqual(plan["schema"], "SRC")
+        self.assertEqual(plan["excluded"], ["EMPLOYEES"])
+        self.assertEqual(plan["data_only"], ["SAL_HISTORY"])
+        self.assertEqual(plan["dependents"], ["VIEW~V_EMP"])
+        # L'index part par la cascade, pas par dependance : deux voies,
+        # un seul resultat — c'est ce qui compte pour l'etape 16.
+        self.assertEqual(
+            set(plan["ignored"]),
+            {"TABLE~EMPLOYEES", "INDEX~EMP_EMP_ID_PK", "VIEW~V_EMP"},
+        )
+        self.assertEqual(
+            set(plan["segment_ignored"]),
+            {"TABLE~EMPLOYEES", "INDEX~EMP_EMP_ID_PK", "TABLE~SAL_HISTORY"},
+        )
+
+        filtres = self.controles(s)
+        self.assertEqual(len(filtres), 1)
+        self.assertEqual(filtres[0].status, "OK")
+        self.assertIn("1 table(s) hors duplication", filtres[0].message)
+        self.assertIn("1 objet(s) dependant(s) retire(s)", filtres[0].message)
+
+    def test_le_check_resout_le_filtre_sans_le_depenser(self):
+        """`check` promet un verdict, pas un export — et il doit deja
+        dire ce qui sera filtre.
+
+        Resoudre le plan ici, c'est le rendre visible **avant** toute
+        mutation : un nom de table inconnu se voit au check, ou rien ne
+        coute encore. L'artefact est le meme que celui d'un `run`, et
+        c'est le meme qu'un `resume` retrouvera.
+        """
+        s = self.nouveau(config={"EXCLUDE_TABLES": "EMPLOYEES"},
+                         source=self.source(), check_only=True,
+                         only=tuple(range(1, 10)))
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        self.assertEqual(s.state.artifacts["table_filter"]["excluded"],
+                         ["EMPLOYEES"])
+        self.assertEqual(self.scripts(s), "")
+
+    def test_un_filtre_sans_correspondance_est_un_avertissement(self):
+        """Le cas ou le plan est inactif, et ou se taire serait grave.
+
+        Une table mal nommee, aucune table filtree : le schema part
+        **entier**, et rien n'en empecherait le tieps. Le controle
+        existe quand meme — il n'est pas supprime parce que « rien n'a
+        ete designe » — et il n'empeche pas le run, parce qu'un refus
+        rendrait le changement de nom inobservable.
+        """
+        s = self.nouveau(config={"EXCLUDE_TABLES": "EMPLOYES"},  # faute de frappe
+                         source=self.source())
+        self.assertEqual(s.aller(), ec.SUCCESS)
+
+        filtres = self.controles(s)
+        self.assertEqual(len(filtres), 1)
+        self.assertEqual(filtres[0].status, "WARN")
+        self.assertEqual(filtres[0].code, ec.PREREQ)
+        self.assertIn("aucune table designee", filtres[0].message)
+        self.assertIn("EXCLUDE_TABLES=EMPLOYES", filtres[0].detail[0])
+        # Et le schema n'est pas filtre pour autant : le parfile ne
+        # porte aucune exclusion, ce qui est exactement ce que le
+        # message annonce.
+        self.assertNotIn("exclude=table:", self.scripts(s))
+
+    # -- Etapes 9, 11, 14 : les trois destins du plan ----------------------
+
+    def test_les_segments_filtres_ne_sont_plus_comptes(self):
+        """L'estimation d'espace doit demander la place des segments qui
+        voyagent, pas celle de ceux qui restent.
+
+        Mode A et mode B ont la meme regle ici : dans les deux cas les
+        segments ne voyagent pas. Les deux signatures passent a
+        l'etape 9 — et non un seul d'entre eux, ce qui ferait une
+        estimation exactement deux fois trop optimiste sur ce schema.
+        """
+        s = self.nouveau(
+            config={"EXCLUDE_TABLES": "EMPLOYEES",
+                    "EXCLUDE_TABLES_DATA": "SAL_HISTORY"},
+            source=self.source(),
+        )
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        self.assertEqual(
+            [q for q in s.source_adapter.queries
+             if q.startswith("segment_signatures")],
+            ["segment_signatures 3"],
+        )
+
+    def test_la_clause_exclude_atteint_les_deux_parfiles(self):
+        """Le filtre agit a l'export **et** a l'import.
+
+        L'import ne peut pas se passer de la clause : un `impdp` rejoue
+        sur un dump deja filtre ne re-echouerait pas, mais il importe
+        tout ce que le dump contient — et le dump est le seul endroit ou
+        l'`exclude=` d'export ait agi. Les deux parfiles sont donc
+        examines separement, jamais l'un a la place de l'autre.
+        """
+        s = self.nouveau(config={"EXCLUDE_TABLES": "EMPLOYEES"},
+                         source=self.source())
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        export = self.scripts(s, "source")
+        imp = self.scripts(s, "cible")
+        self.assertTrue(any("exclude" in line and "table" in line and "employees" in line.lower()
+                            for line in export.splitlines()))
+        self.assertTrue(any("exclude" in line and "table" in line and "employees" in line.lower()
+                            for line in imp.splitlines()))
+
+    def test_la_query_n_est_posee_qu_a_l_export(self):
+        """Le mode B agit au seul endroit ou les lignes existent encore.
+
+        Le dump ne contient deja plus les lignes : repeter `QUERY` a
+        l'import ne ferait que rejeter ce qui n'y est pas. Et surtout,
+        la structure **doit** partir — la clause `exclude=` est donc
+        absente des deux parfiles, la ou le mode A la produit tous deux.
+        """
+        s = self.nouveau(config={"EXCLUDE_TABLES_DATA": "SAL_HISTORY"},
+                         source=self.source())
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        export = self.scripts(s, "source")
+        # La valeur est portee par **une seule** occurrence du prefixe
+        # `query=`. Un `query=query=...` rejoue par Data Pump
+        # (`LRM-00116: syntax error at 'query' following '='`), et une
+        # assertion qui se contente d'un `in` ne le verrait pas : le
+        # doublon contient lui-meme la sous-chaine attendue.
+        lignes = [line for line in export.splitlines()
+                  if "where 1=2" in line.lower()]
+        self.assertTrue(lignes)
+        for ligne in lignes:
+            self.assertTrue(ligne.startswith("query=src.sal_history:"), ligne)
+            self.assertNotIn("query=query=", ligne)
+        self.assertNotIn("exclude=table:", export)
+
+        imp = self.scripts(s, "cible")
+        self.assertNotIn("query=", imp)
+        self.assertNotIn("exclude=table:", imp)
+
+    def test_une_fk_non_creable_en_mode_b_ne_fait_pas_echouer_l_import(self):
+        """Le mode B peut rendre une FK insatisfiable : c'est attendu.
+
+        Les donnees de `SAL_HISTORY` ne partent pas, mais une table
+        enfant peut garder ses lignes et pointer vers des cles parentes
+        absentes : `impdp` charge alors tout ce qu'il peut et echoue
+        seulement sur `ORA-02298`/`ORA-39083`. Faire echouer le run sur
+        cette seule consequence du mode B rendrait le mode inutilisable,
+        alors que le dump est complet. Le fait est rapporte, le run
+        poursuit.
+        """
+        s = self.nouveau(config={"EXCLUDE_TABLES_DATA": "SAL_HISTORY"},
+                         source=self.source())
+        s.target_runner.rc_datapump["impdp"] = 5
+        s.target_runner.codes_oracle["impdp"] = "ORA-02298 ORA-39083"
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        self.assertEqual(s.statut(14), DONE)
+        self.assertTrue(s.state.artifacts["imported"])
+        avertissements = [c for c in s.pipeline.checks
+                          if c.name == "contraintes referentielles"]
+        self.assertEqual(len(avertissements), 1)
+        self.assertEqual(avertissements[0].status, "WARN")
+
+    def test_un_code_etranger_ramene_l_import_au_chemin_d_echec(self):
+        """La tolerance est bornee : un code hors liste reste un echec.
+
+        `ORA-00942` (table inexistante) accompagne d'une FK non
+        validable n'est pas « le mode B » : le run doit echouer, sans
+        quoi n'importe quelle erreur melangee a une FK passerait pour
+        une consequence attendue.
+        """
+        s = self.nouveau(config={"EXCLUDE_TABLES_DATA": "SAL_HISTORY"},
+                         source=self.source())
+        s.target_runner.rc_datapump["impdp"] = 5
+        s.target_runner.codes_oracle["impdp"] = "ORA-02298 ORA-39083 ORA-00942"
+        self.assertEqual(s.aller(), ec.IMPORT)
+        self.assertEqual(s.statut(14), FAILED)
+
+    def test_sans_mode_b_la_fk_non_creable_reste_un_echec(self):
+        """Aucun filtre de donnees : `ORA-02298` n'a rien d'attendu."""
+        s = self.nouveau(source=self.source())
+        s.target_runner.rc_datapump["impdp"] = 5
+        s.target_runner.codes_oracle["impdp"] = "ORA-02298 ORA-39083"
+        self.assertEqual(s.aller(), ec.IMPORT)
+        self.assertEqual(s.statut(14), FAILED)
+
+    def test_un_job_d_import_echoue_n_est_pas_tolere(self):
+        """L'etat du job prime : `COMPLETED` est requis pour tolerer.
+
+        Un job `FAILED` avec les memes codes n'est pas le mode B
+        nominal — c'est un import interrompu, que l'etat doit faire
+        echouer malgre la liste de codes.
+        """
+        s = self.nouveau(
+            config={"EXCLUDE_TABLES_DATA": "SAL_HISTORY"},
+            source=self.source(),
+            cible=_adaptateur_cible(job_state="FAILED", job_errors="2"),
+        )
+        s.target_runner.rc_datapump["impdp"] = 5
+        s.target_runner.codes_oracle["impdp"] = "ORA-02298 ORA-39083"
+        self.assertEqual(s.aller(), ec.IMPORT)
+        self.assertEqual(s.statut(14), FAILED)
+
+    # -- Etape 16 : ce que le filtre ne doit pas faire passer pour un echec
+
+    def test_un_objet_hors_duplication_n_est_pas_un_manquant(self):
+        """La comparaison doit ignorer ce qu'elle a elle-meme retire.
+
+        `EMPLOYEES` et son index ne partiront pas : l'etape 16 les
+        verrait manquer sur la cible, et conclurait a un import incomplet
+        d'un schema parfaitement duplique. Le retrait doit donc porter
+        sur l'inventaire **source**, et le rapport doit le dire — un
+        ecart silencieusement ignore serait aussi grave qu'un faux echec.
+        """
+        s = self.nouveau(
+            config={"EXCLUDE_TABLES": "EMPLOYEES"},
+            source=self.source(responses=_INVENTAIRE),
+            cible=_adaptateur_cible(responses=_INVENTAIRE),
+        )
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        self.assertEqual(s.statut(16), DONE)
+        detail = "\n".join(s.etape(16).detail)
+        self.assertIn("volontairement non duplique", detail)
+        self.assertIn("filtre de tables", detail)
+        self.assertNotIn("absent(s) de la cible", detail)
+
+    def test_le_plan_figue_prime_sur_la_configuration_d_un_resume(self):
+        """Un `resume` rejoue l'export qu'il a deja commence.
+
+        L'etat porte un plan fige ; la configuration, elle, peut avoir
+        change entre les deux. Ce qui doit primer est l'etat — sinon le
+        second export produit un dump **different** de celui que le
+        premier a deja transfere, et l'import suivra un plan que personne
+        n'a jamais applique. La source n'est meme pas interrogee : la
+        resolution n'a pas lieu une deuxieme fois.
+        """
+        s = self.nouveau(config={"EXCLUDE_TABLES": "EMPLOYEES"},
+                         source=self.source())
+        s.state.artifacts["table_filter"] = TableFilterPlan(
+            schema="SRC", excluded=["DEPARTMENTS"],
+        ).to_dict()
+        self.assertEqual(s.aller(), ec.SUCCESS)
+
+        export = self.scripts(s, "source")
+        has_departments = any("exclude" in line and "table" in line and "departments" in line.lower()
+                              for line in export.splitlines())
+        has_employees = any("exclude" in line and "table" in line and "employees" in line.lower()
+                            for line in export.splitlines())
+        self.assertTrue(has_departments)
+        self.assertFalse(has_employees)
+        self.assertEqual(
+            [q for q in s.source_adapter.queries if "bin$%" in q], [],
+        )
+
+    # -- Rapport -----------------------------------------------------------
+
+    def test_les_quatre_cles_paraissent_dans_le_rapport(self):
+        """Un rapport qui n'affiche pas le filtre impose de relire la
+        configuration pour savoir ce que le run a fait.
+
+        Les quatre cles sont publiees, y compris celles qui ne sont pas
+        posees : c'est leur absence qui dit qu'aucun filtre n'etait
+        configure, et cette information se perd si le rapport ne les
+        mentionne jamais.
+        """
+        s = self.nouveau(config={"EXCLUDE_TABLES": "EMPLOYEES"},
+                         source=self.source())
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        options = s.rapport()["options"]
+        for cle in ("EXCLUDE_TABLES", "EXCLUDE_TABLES_REGEX",
+                    "EXCLUDE_TABLES_DATA", "EXCLUDE_TABLES_DATA_REGEX"):
+            self.assertIn(cle, options)
+        self.assertIn("EMPLOYEES", options["EXCLUDE_TABLES"])
+
+    def test_le_rapport_texte_decrit_le_filtre_resolu(self):
+        """Le texte dit ce qui a change, et rien de plus.
+
+        Le plan complet est dans le JSON ; le texte ne retient que les
+        chiffres — combien hors duplication, combien sans donnees — et
+        c'est ce que l'exploitant lit en premier.
+        """
+        from osd.report import render_text
+
+        s = self.nouveau(
+            config={"EXCLUDE_TABLES": "EMPLOYEES",
+                    "EXCLUDE_TABLES_DATA": "SAL_HISTORY"},
+            source=self.source(),
+        )
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        texte = render_text(s.rapport())
+        self.assertIn("table_filter", texte)
+        self.assertIn("1 table(s) hors duplication, 1 sans donnee(s)", texte)
+        self.assertIn("retire(s) de la comparaison : 3 objet(s)", texte)
+
+    def test_un_filtre_vide_ne_doit_pas_encombrer_le_rapport(self):
+        """Le cas par defaut — aucun filtre — ne merite aucune ligne.
+
+        Rappeler partout l'absence d'options inutilisees se lit mal :
+        l'exploitant finit par ne plus regarder la section, et c'est
+        exactement la section dont il aura besoin le jour ou un filtre
+        sera pose.
+        """
+        from osd.report import render_text
+
+        s = self.nouveau(source=self.source())
+        self.assertEqual(s.aller(), ec.SUCCESS)
+        texte = render_text(s.rapport())
+        self.assertNotIn("table_filter", texte)
+        # L'artefact existe dans le JSON — c'est le texte qui le tait.
+        self.assertEqual(
+            s.rapport()["artifacts"]["table_filter"]["excluded"], [])
 
 
 if __name__ == "__main__":  # pragma: no cover
