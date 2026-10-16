@@ -6,6 +6,12 @@ logs/*
 
 work/*
 !work/.gitkeep
+# Exception : `work/probes/` porte des **scripts** d'analyse, pas des
+# sorties de run. Seuls les `.py` sont suivis ; les `.log`, `.out`,
+# `.err`, `.ok` et `__pycache__` du meme dossier restent ignores.
+!work/probes/
+work/probes/*
+!work/probes/*.py
 
 reports/*
 !reports/.gitkeep
