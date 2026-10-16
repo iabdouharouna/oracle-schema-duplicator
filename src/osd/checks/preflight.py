@@ -288,8 +288,15 @@ def check_table_filter(plan) -> Optional[CheckResult]:
     entier, sans que le rapport dise jamais que la cle n'a servi a rien ;
     dire « aucun filtre » alors que la configuration en porte un serait
     le meme mensonge a l'envers.
+
+    `EXCLUDE_STANDALONE_TABLES` suit la meme regle, bien qu'il ne se
+    resout pas en liste d'entrees : une regle posee sur un schema dont
+    toutes les tables sont reliees ou lues par du code ne filtre rien, et
+    le controle le dit — « aucune table isolee ». Le distinguer de
+    « regle absente » est le seul moyen, pour l'exploitant, de savoir que
+    sa ligne a bien ete lue.
     """
-    if not (plan.active or plan.unmatched):
+    if not (plan.active or plan.unmatched or plan.standalone_requested):
         return None
 
     detail: List[str] = []
@@ -301,6 +308,10 @@ def check_table_filter(plan) -> Optional[CheckResult]:
         detail.append(_enum("retires avec elles", plan.dependents, limite=6))
     if plan.data_only:
         detail.append(_enum("structure sans donnees", plan.data_only))
+    if plan.standalone:
+        detail.append(
+            _enum("isolees et inutilisees", plan.standalone)
+        )
     if plan.overlap:
         detail.append(
             _enum("dans les deux listes : exclusion totale appliquee",
@@ -316,12 +327,16 @@ def check_table_filter(plan) -> Optional[CheckResult]:
         )
         if plan.dependents:
             message += f", {len(plan.dependents)} objet(s) dependant(s) retire(s)"
-    else:
+    elif plan.unmatched:
         # Filtre configure mais **sans effet** : aucune entree n'a
         # designe de table. Annoncer « 0 table hors duplication » sans
         # plus ferait passer une configuration qui ne filtre rien pour
         # un filtre qui filtre bien.
         message = f"aucune table designee, {len(plan.unmatched)} entree(s) sans effet"
+    else:
+        # La regle isolee a tourne et n'a rien trouve. Ce n'est pas une
+        # faute : le schema est simplement entierement relie, ou lu.
+        message = "aucune table isolee (EXCLUDE_STANDALONE_TABLES)"
 
     indices: List[str] = []
     if plan.unmatched:

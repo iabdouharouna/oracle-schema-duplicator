@@ -450,6 +450,7 @@ class Pipeline:
             tables_regex=self.cfg.get("EXCLUDE_TABLES_REGEX"),
             tables_data=self.cfg.get("EXCLUDE_TABLES_DATA"),
             tables_data_regex=self.cfg.get("EXCLUDE_TABLES_DATA_REGEX"),
+            standalone=self.cfg.get("EXCLUDE_STANDALONE_TABLES"),
         )
         self.state.artifacts["table_filter"] = plan.to_dict()
         return plan

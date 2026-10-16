@@ -198,6 +198,21 @@ def _schema() -> Dict[str, Spec]:
             doc="Meme chose, en expressions regulieres Python "
                 "insensibles a la casse.",
         ),
+        "EXCLUDE_STANDALONE_TABLES": Spec(
+            "bool", False,
+            doc="Tables isolees **et inutilisees** : qu'aucune cle "
+                "etrangere ne relie (ni sortante, ni entrante d'un autre "
+                "schema) et qu'aucun objet autre qu'une table ne lit "
+                "(vue, procedure, fonction, package, type, synonyme, ou "
+                "trigger d'une **autre** table). Le trigger pose sur la "
+                "table elle-meme ne compte pas : il fait partie de son "
+                "DDL. Elles basculent en mode « structure sans donnees ». "
+                "L'isolement referentiel seul ne suffit pas : une table "
+                "sans FK peut etre lue par du code, et retirer ses lignes "
+                "viderait une donnee attendue. Aucune relation "
+                "referentielle ne subsiste pour autant, donc retirer ces "
+                "lignes ne peut pas rendre une FK invalide.",
+        ),
         # -- Securite et gardes-fous -------------------------------------
         "ALLOW_EXISTING_TARGET": Spec(
             "bool", False, doc="Refuse par defaut d'ecraser un schema cible existant."
@@ -631,12 +646,17 @@ def validate(cfg: Config, *, warnings: Optional[List[str]] = None) -> None:
     # `CONTENT=METADATA_ONLY` n'exporte aucune ligne : le mode « structure
     # sans donnees » n'a alors rien a retirer. L'option est acceptee --
     # elle n'est pas fausse -- mais signaler son silence vaut mieux que de
-    # laisser croire a un filtrage actif.
-    if values["CONTENT"] == "METADATA_ONLY" and (
-            values.get("EXCLUDE_TABLES_DATA")
-            or values.get("EXCLUDE_TABLES_DATA_REGEX")):
+    # laisser croire a un filtrage actif. Les trois cles du mode B sont
+    # nommees separement quand elles sont posees : un avertissement qui
+    # cite une cle absente envoie corriger une ligne qui n'existe pas.
+    sans_effet = [
+        cle for cle in ("EXCLUDE_TABLES_DATA", "EXCLUDE_TABLES_DATA_REGEX",
+                        "EXCLUDE_STANDALONE_TABLES")
+        if values.get(cle)
+    ]
+    if values["CONTENT"] == "METADATA_ONLY" and sans_effet:
         warnings.append(
-            "EXCLUDE_TABLES_DATA sans effet : CONTENT=METADATA_ONLY "
+            f"{', '.join(sans_effet)} sans effet : CONTENT=METADATA_ONLY "
             "n'exporte deja aucune donnee"
         )
 

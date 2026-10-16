@@ -900,6 +900,37 @@ class TestFiltrageDesTables(unittest.TestCase):
         self.assertNotIn("T08", detail)
         self.assertNotIn("T09", detail)
 
+    def test_la_regle_isolee_sans_resultat_est_un_controle_qui_dit_zero(self):
+        """Une regle posee sur un schema entierement relie doit se voir.
+
+        Le plan est inactif — rien a filtrer — mais la cle a bien ete lue.
+        Sans ce controle, « regle posee » et « regle absente » auraient le
+        meme rapport : l'exploitant ne saurait pas si sa ligne a servi.
+        """
+        r = preflight.check_table_filter(
+            TableFilterPlan(schema="SRC", standalone_requested=True)
+        )
+        self.assertIsNotNone(r)
+        self.assertEqual(r.status, OK)
+        self.assertIn("aucune table isolee", r.message)
+
+    def test_les_tables_isolees_sont_enumerees(self):
+        """Le detail nomme les isolees, hors du simple compteur du mode B.
+
+        Elles sont un sous-ensemble de `data_only` : sans ligne dediee, le
+        rapport dirait « 2 sans donnee(s) » sans dire que la regle en est
+        la cause, ni lesquelles.
+        """
+        r = preflight.check_table_filter(
+            TableFilterPlan(schema="SRC", data_only=["REGIONS", "TMP_LOAD"],
+                            standalone=["REGIONS", "TMP_LOAD"],
+                            standalone_requested=True)
+        )
+        self.assertEqual(r.status, OK)
+        detail = " ".join(r.detail)
+        self.assertIn("isolees", detail)
+        self.assertIn("REGIONS", detail)
+
     def test_le_plan_fait_partie_du_controle(self):
         """Le rapport machine doit pouvoir afficher le plan resolu.
 

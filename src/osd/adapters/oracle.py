@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from ..config import SQL_DELIMITER
 from ..errors import ConnectionError_, OsdError, PrereqError
@@ -436,11 +436,30 @@ class OracleAdapter:
             "select sum(nvl(bytes, 0)) from dba_segments "
             f"where owner = '{_lit(schema)}'"
         )
-        exclus = _segments_exclus(segment_signatures)
-        if exclus:
-            sql += f" and not ({exclus})"
+        exclus = _segment_exclusions(segment_signatures)
         try:
-            return _to_int(self.scalar(sql))
+            if not any(exclus.values()):
+                return _to_int(self.scalar(sql))
+            # Le retranchement se fait ici, en Python, sur les segments
+            # lus en entier. La table filtree ne figure donc dans aucune
+            # requete : une clause `segment_name in (...)` portant
+            # plusieurs milliers de noms atteignait les deux plafonds a la
+            # fois — 1000 expressions cote Oracle (`ORA-01795`) et la
+            # longueur d'une ligne de script cote shell distant.
+            rows = self.query(
+                "select segment_type, segment_name, nvl(bytes, 0) "
+                "from dba_segments "
+                f"where owner = '{_lit(schema)}'"
+            )
+            total = 0
+            for row in rows:
+                if len(row) < 3:
+                    continue
+                if _segment_exclu(str(row[0]).strip(), str(row[1]).strip(),
+                                  exclus):
+                    continue
+                total += _to_int(row[2])
+            return total
         except OsdError:
             # Un compte sans acces a DBA_SEGMENTS ne doit pas bloquer la
             # duplication : l'estimation retombe sur un plancher.
@@ -483,32 +502,38 @@ def _assemble(
     return build_script(body, argv, env=env)
 
 
-def _segments_exclus(signatures: Sequence[str]) -> str:
-    """Predicat SQL retranchant les segments des objets non dupliques.
+#: Familles de segments, chacune avec les types de `DBA_SEGMENTS` qui la
+#: portent. Les types cites sont ceux observes sur la 19c reelle, et ils
+#: ne sont pas ceux de `DBA_OBJECTS` :
+#:
+#: * un segment de partition porte le **nom de la table ou de l'index**,
+#:   pas celui de la partition (`AQ$_SUBSCRIBER_LWM` en occupe plusieurs,
+#:   `WRP$_REPORTS_IDX01` egalement ; zero divergence sur toute la base) ;
+#: * les LOB sont `LOBSEGMENT` et `LOBINDEX` cote segments, alors que les
+#:   objets sont `LOB` et `INDEX` cote `DBA_OBJECTS`, sous les noms
+#:   generes `SYS_LOB...$$` et `SYS_IL...$$` — les deux exposes par
+#:   `DBA_LOBS`.
+#:
+#: Les familles ne se recouvrent pas : un type de segment n'appartient
+#: qu'a une seule, ce dont depend l'addition sans double compte.
+_SEGMENT_FAMILLES = (
+    ("TABLE", ("TABLE", "TABLE PARTITION", "TABLE SUBPARTITION")),
+    ("INDEX", ("INDEX", "INDEX PARTITION", "INDEX SUBPARTITION", "LOBINDEX")),
+    ("LOB", ("LOBSEGMENT", "LOB PARTITION", "LOB SUBPARTITION")),
+)
+
+
+def _segment_exclusions(signatures: Sequence[str]) -> Dict[str, Set[str]]:
+    """Noms a retrancher de `DBA_SEGMENTS`, ranges par famille de types.
 
     Le type d'objet porte le filtre, jamais le nom seul : les noms
     circulent librement dans un schema, et retrancher un segment parce
-    qu'il s'appelle comme une table filtrees retirerait les octets d'un
-    objet sans rapport — une place manquante que rien n'expliquerait
-    plus tard.
-
-    Les types cites sont ceux de `DBA_SEGMENTS`, observes sur la 19c
-    reelle, et ils ne sont pas ceux de `DBA_OBJECTS` :
-
-    * un segment de partition porte le **nom de la table ou de l'index**,
-      pas celui de la partition (`AQ$_SUBSCRIBER_LWM` en occupe plusieurs,
-      `WRP$_REPORTS_IDX01` egalement ; zero divergence sur toute la base) ;
-    * les LOB sont `LOBSEGMENT` et `LOBINDEX` cote segments, alors que
-      les objets sont `LOB` et `INDEX` cote `DBA_OBJECTS`, sous les noms
-      generes `SYS_LOB...$$` et `SYS_IL...$$` — les deux exposes par
-      `DBA_LOBS`.
-
-    Retourne une chaine vide quand rien n'est filtre : l'appelant omet
-    alors la clause, et la requete reste celle d'avant.
+    qu'il s'appelle comme une table filtree retirerait les octets d'un
+    objet sans rapport — une place manquante que rien n'expliquerait plus
+    tard. Un nom dont le type n'appartient a aucune famille connue est
+    ignore : le laisser dans le total est l'erreur prudente.
     """
-    tables: List[str] = []
-    index: List[str] = []
-    lob: List[str] = []
+    familles: Dict[str, Set[str]] = {cle: set() for cle, _ in _SEGMENT_FAMILLES}
     for brut in signatures:
         sig = str(brut)
         if "~" not in sig:
@@ -517,35 +542,25 @@ def _segments_exclus(signatures: Sequence[str]) -> str:
         type_obj, nom = type_obj.strip(), nom.strip()
         if not nom:
             continue
-        if type_obj.startswith("TABLE"):
-            tables.append(nom)
-        elif type_obj.startswith("INDEX"):
-            index.append(nom)
-        elif type_obj.startswith("LOB"):
-            lob.append(nom)
+        for cle, _ in _SEGMENT_FAMILLES:
+            if type_obj.startswith(cle):
+                familles[cle].add(nom)
+                break
+    return familles
 
-    clauses: List[str] = []
-    for types, noms in (
-        ("TABLE", tables),
-        ("INDEX", index),
-        ("LOB", lob),
-    ):
-        if not noms:
-            continue
-        if types == "TABLE":
-            segment_types = "'TABLE', 'TABLE PARTITION', 'TABLE SUBPARTITION'"
-        elif types == "INDEX":
-            # `LOBINDEX` est ici : l'objet est un `INDEX` cote
-            # `DBA_OBJECTS`, mais son segment est un index de LOB.
-            segment_types = ("'INDEX', 'INDEX PARTITION', "
-                             "'INDEX SUBPARTITION', 'LOBINDEX'")
-        else:
-            segment_types = "'LOBSEGMENT', 'LOB PARTITION', 'LOB SUBPARTITION'"
-        liste = ", ".join("'" + _lit(n) + "'" for n in sorted(set(noms)))
-        clauses.append(
-            f"(segment_type in ({segment_types}) and segment_name in ({liste}))"
-        )
-    return " or ".join(clauses)
+
+def _segment_exclu(
+    segment_type: str, segment_name: str, familles: Dict[str, Set[str]]
+) -> bool:
+    """Le segment est-il l'un de ceux qui ne voyagent pas ?
+
+    Les familles ne se recouvrent pas : un type de segment n'appartient
+    qu'a une seule, et un nom ne compte alors que dans la sienne.
+    """
+    for cle, types in _SEGMENT_FAMILLES:
+        if segment_type in types and segment_name in familles[cle]:
+            return True
+    return False
 
 
 def _lit(value: str) -> str:
@@ -559,9 +574,27 @@ def _lit(value: str) -> str:
 
 
 def _to_int(value: Any) -> int:
+    """Lit un scalaire rendu par SQL*Plus.
+
+    Les **grands** nombres sont rendus en notation scientifique
+    (`1.0369E+11` pour une somme d'octets de 103 Go), parce que SQL*Plus
+    ajuste le format a la largeur de colonne. Les lire par `int` seul
+    echouait, et l'echec silencieux valait zero : l'estimation d'espace
+    d'un schema volumineux etait donc nulle, et la place disponible
+    n'etait plus verifiee du tout — exactement le sens dangereux, celui
+    d'une estimation sous-evaluee. La conversion flottante perd de la
+    precision, sans consequence pour un ordre de grandeur.
+    """
+    texte = str(value).strip()
+    if not texte:
+        return 0
     try:
-        return int(str(value).strip() or 0)
-    except (TypeError, ValueError):
+        return int(texte)
+    except ValueError:
+        pass
+    try:
+        return int(float(texte))
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 

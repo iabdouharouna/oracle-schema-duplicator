@@ -144,12 +144,14 @@ ne couvre que les tables. Voir « `ORA-31684` » plus bas.
 
 ## Filtrage des tables
 
-Quatre clés, deux modes — et ils ne disent pas la même chose.
+Quatre clés de liste, deux modes — et ils ne disent pas la même chose. Une
+cinquième clé, un booléen, alimente le second mode.
 
 | Clés | Effet |
 |------|-------|
 | `EXCLUDE_TABLES`, `EXCLUDE_TABLES_REGEX` | la table ne part **pas du tout** : ni structure ni données |
 | `EXCLUDE_TABLES_DATA`, `EXCLUDE_TABLES_DATA_REGEX` | la structure part, les lignes non |
+| `EXCLUDE_STANDALONE_TABLES` | la structure part, les lignes non — pour toutes les tables **isolées et inutilisées** du schéma |
 
 Les listes portent des noms séparés par des virgules ; les deux clés `_REGEX`
 sont des motifs `re` Python, ignorés à la casse (`^TMP_` désigne toutes les
@@ -185,6 +187,49 @@ dans un avertissement `contraintes referentielles` et poursuit. Un code
 ordinaire. Pour éviter le cas : exclure aussi les données des tables enfants,
 ou ne pas exclure celles des parents. Mesuré sur une 19c réelle (`HR` :
 `JOB_HISTORY`, 11 lignes, vers `EMPLOYEES` et `DEPARTMENTS`, 0 ligne).
+
+**Tables isolées — `EXCLUDE_STANDALONE_TABLES=true`.** Une clé booléenne qui
+n'est pas un troisième mode : elle alimente le mode « structure sans données »
+et y verse les tables **isolées et inutilisées** du schéma source. Deux
+conditions doivent tenir ensemble :
+
+1. **aucune FK ne la relie**, ni en sortie (elle ne référence rien) ni en
+   entrée (aucune contrainte, d'aucun schéma, ne la référence) — exactement
+   `NOT EXISTS` des deux côtés de `DBA_CONSTRAINTS` ;
+2. **aucun objet autre qu'une table ne la lit** : vue, procédure, fonction,
+   package, type, synonyme, ou trigger d'une **autre** table, lu dans
+   `DBA_DEPENDENCIES`. Le trigger posé sur la table elle-même **ne compte
+   pas** : il fait partie de son DDL et voyage avec elle.
+
+Le second volet est essentiel : l'absence de FK ne dit pas qu'une table est
+morte. Une table sans relation peut très bien être lue par un package, et
+retirer ses lignes viderait une donnée que l'application attend. La règle ne
+vise que les tables que **rien** n'utilise.
+
+Cette règle **ne peut pas** provoquer `ORA-02298` : une table isolée n'ayant
+aucune relation référentielle, retirer ses lignes ne laisse aucune clé parente
+manquante, donc aucune FK à ne pas valider. La conséquence du mode B décrite
+plus haut ne s'applique pas ici.
+
+**À activer en connaissance de cause.** La règle est volontairement
+conservatrice, et c'est le second volet qui la resserre le plus : sur un schéma
+applicatif, beaucoup de tables sans FK sont en réalité lues par du code. Mesuré
+sur un schéma réel de 7 023 tables : 5 634 sont isolées par FK, mais **1 726
+seulement** le sont aussi de tout lecteur — dont les triggers propres comptent
+pour l'exclusion inverse (un trigger posé sur la table ne la disqualifie pas).
+Autrement dit, l'espace non copié varie fortement selon qu'on compte ou non les
+lecteurs — et c'est ce que l'estimation de l'étape 9 reflète. `osd check` en
+donne la liste exacte sans rien exporter : c'est la vérification à faire avant
+de l'activer. Comme tout filtre, elle est résolue à l'étape 6 puis figée ; un
+schéma entièrement relié ou intégralement lu par du code donne une liste vide,
+que l'étape 6 signale sans échec.
+
+**Limite du second volet.** `DBA_DEPENDENCIES` ne connaît que les références
+**statiques**. Un package qui nomme une table par SQL dynamique
+(`EXECUTE IMMEDIATE`) n'y figure pas, et l'outil ne lit pas le code source pour
+le deviner : la table serait alors classée isolée à tort, ses lignes non
+copiées. Un schéma dont l'application lit des tables de données en SQL
+dynamique doit laisser `EXCLUDE_STANDALONE_TABLES=false`.
 
 **`INCLUDE` est incompatible avec `EXCLUDE` et `EXCLUDE_TABLES*`** : la 19c
 refuse les deux dans le même parfile (`UDE-00011: parameter include is

@@ -2662,6 +2662,30 @@ class TestFiltrageDesTables(CasDeTest):
     def controles(self, s: Scenario, nom: str = "filtrage des tables"):
         return [c for c in s.pipeline.checks if c.name == nom]
 
+    def nouveau(self, **kw: Any) -> Scenario:
+        """Scenario dont la cible porte le meme inventaire que la source.
+
+        L'etape 16 lit `DBA_OBJECTS` des deux cotes avec la **meme**
+        requete : celle de `_inventory`, partagee avec le plan de filtrage
+        (`checks.table_filter._signatures`). Le faux la resout depuis une
+        liste par cote — `signatures` pour la source, puisque le plan y
+        lit lui-meme l'inventaire, et `responses["dba_objects"]` pour la
+        cible, qui est un `FakeAdapter` ordinaire. Les deux listes doivent
+        donc designer les memes objets : sans quoi l'ecart que l'etape 16
+        constaterait serait fabrique par la simulation, et le test de
+        comparaison ne prouverait rien de la duplication.
+
+        La cible n'est completee que si elle ne declare pas deja son
+        inventaire : un test qui eprouve un objet manquant — ou l'effet de
+        la liste `ignored` — pose le sien, et le garde.
+        """
+        s = super().nouveau(**kw)
+        cible = s.target_adapter
+        if (isinstance(cible, support.FakeAdapter)
+                and "dba_objects" not in cible.responses):
+            cible.responses["dba_objects"] = [list(sig) for sig in self.SIGNATURES]
+        return s
+
     # -- Etape 6 : resolution --------------------------------------------
 
     def test_l_etape_6_resout_le_filtre_et_le_figge(self):
@@ -2701,6 +2725,35 @@ class TestFiltrageDesTables(CasDeTest):
         self.assertEqual(filtres[0].status, "OK")
         self.assertIn("1 table(s) hors duplication", filtres[0].message)
         self.assertIn("1 objet(s) dependant(s) retire(s)", filtres[0].message)
+
+    def test_la_regle_isolee_traverse_la_chaine_en_mode_sans_donnees(self):
+        """`EXCLUDE_STANDALONE_TABLES` : de la config a l'export, en mode B.
+
+        Aucune FK n'est declaree sur ce faux schema, mais `V_EMP` lit
+        `EMPLOYEES` : la table n'est donc pas inutilisee, et la regle la
+        laisse partir en entier. Les deux autres, qu'aucune FK ni aucun
+        objet ne touche, basculent en mode B. Le plan les fige, et
+        l'export recoit des `query=` — jamais un `exclude=`, qui
+        contredirait `INCLUDE` et changerait la nature de la regle.
+        """
+        s = self.nouveau(config={"EXCLUDE_STANDALONE_TABLES": "true"},
+                         source=self.source())
+        self.assertEqual(s.aller(), ec.SUCCESS)
+
+        plan = s.state.artifacts["table_filter"]
+        self.assertTrue(plan["standalone_requested"])
+        self.assertEqual(plan["standalone"], ["DEPARTMENTS", "SAL_HISTORY"])
+        self.assertEqual(plan["data_only"], ["DEPARTMENTS", "SAL_HISTORY"])
+        self.assertEqual(plan["excluded"], [])
+
+        export = self.scripts(s, "source")
+        self.assertIn("query=src.departments:", export)
+        self.assertNotIn("query=src.employees:", export)
+        # Le mode A emet `exclude=TABLE:"..."` ; l'import de verification
+        # de l'etape 16 pose `exclude=USER`. C'est le type `TABLE` qui
+        # distingue les deux, pas le mot `exclude`.
+        self.assertNotIn("exclude=table:", export)
+        self.assertNotIn("query=", self.scripts(s, "cible"))
 
     def test_le_check_resout_le_filtre_sans_le_depenser(self):
         """`check` promet un verdict, pas un export — et il doit deja
@@ -2888,10 +2941,18 @@ class TestFiltrageDesTables(CasDeTest):
         sur l'inventaire **source**, et le rapport doit le dire — un
         ecart silencieusement ignore serait aussi grave qu'un faux echec.
         """
+        # La cible est ce que le dump filtre a produit : les objets
+        # volontairement non dupliques n'y figurent pas. C'est cette
+        # absence qui rendrait l'assertion faible — l'etape 16 ne dirait
+        # pas « manquant » meme sans le retrait — si la cible portait
+        # l'inventaire complet de la source.
         s = self.nouveau(
             config={"EXCLUDE_TABLES": "EMPLOYEES"},
-            source=self.source(responses=_INVENTAIRE),
-            cible=_adaptateur_cible(responses=_INVENTAIRE),
+            source=self.source(),
+            cible=_adaptateur_cible(responses={"dba_objects": [
+                ["TABLE", "DEPARTMENTS"],
+                ["TABLE", "SAL_HISTORY"],
+            ]}),
         )
         self.assertEqual(s.aller(), ec.SUCCESS)
         self.assertEqual(s.statut(16), DONE)

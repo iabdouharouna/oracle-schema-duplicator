@@ -357,6 +357,288 @@ class TestClausesDeParfile(unittest.TestCase):
         self.assertEqual(plan.query_lines(), [])
 
 
+class TestTablesIsolees(unittest.TestCase):
+    """`EXCLUDE_STANDALONE_TABLES` : une regle qui alimente le mode B.
+
+    La definition a trois volets, et chacun suffit a **ecarter** une
+    table : une FK sortante, une FK entrante d'un schema quelconque, ou
+    un objet non-table qui la lit. Les volets sont verifies separement —
+    une table liee d'un seul cote, ou lue par une seule vue, n'est pas
+    isolee, et un test qui n'en regarderait qu'un declarerait isolee une
+    table que le schema utilise.
+    """
+
+    def test_sans_fk_ni_usage_toutes_les_tables_sont_isolees(self):
+        """Aucune relation, aucun lecteur : toutes basculent en mode B.
+
+        `dependants` est vide ici : aucune vue, aucun package ne lit ces
+        tables. C'est ce second silence, autant que l'absence de FK, qui
+        autorise a retirer leurs lignes.
+        """
+        plan = plan_table_filter(_faux(dependants={}), "SRC", standalone=True)
+        self.assertTrue(plan.standalone_requested)
+        self.assertEqual(plan.standalone, sorted(_TABLES))
+        self.assertEqual(plan.data_only, sorted(_TABLES))
+        self.assertEqual(plan.excluded, [])
+        self.assertTrue(plan.active)
+
+    def test_un_objet_non_table_ecarte_la_table(self):
+        """Une table lue par une vue ou un package n'est pas morte.
+
+        `EMPLOYEES` n'est liee par aucune FK — mais `V_EMP` (vue) et
+        `PKG_EMP` (package) la lisent. Retirer ses lignes viderait une
+        donnee attendue ; la table part donc en entier, et seule
+        l'absence des deux autres lecteurs les laisse isolees.
+        """
+        plan = plan_table_filter(_faux(), "SRC", standalone=True)
+        self.assertNotIn("EMPLOYEES", plan.standalone)
+        self.assertEqual(
+            plan.standalone,
+            ["DEPARTMENTS", "REGIONS", "SAL_HISTORY", "TMP_LOAD"],
+        )
+
+    def test_un_trigger_propre_ne_disqualifie_pas(self):
+        """Le trigger pose sur la table elle-meme n'est pas un lecteur.
+
+        Il fait partie de son DDL et voyage avec elle : une table sans FK
+        dont le seul « utilisateur » est son propre trigger reste isolee.
+        """
+        faux = _faux(
+            possedes={**_POSSEDES,
+                      "SAL_HISTORY": ["SAL_HISTORY", "SAL_HIST_PK", "TRG_SAL"]},
+            dependants={"SAL_HISTORY": ["TRG_SAL"]},
+            signatures=_SIGNATURES + [["TRIGGER", "TRG_SAL"]],
+        )
+        plan = plan_table_filter(faux, "SRC", standalone=True)
+        self.assertIn("SAL_HISTORY", plan.standalone)
+
+    def test_un_trigger_d_une_autre_table_disqualifie(self):
+        """Un trigger d'une **autre** table, dont le corps lit celle-ci, la
+        disqualifie.
+
+        Le trigger part avec la table qui le porte, pas avec celle qu'il
+        lit : retirer les lignes de cette derniere viderait une donnee
+        que le trigger manipule.
+        """
+        faux = _faux(
+            possedes={**_POSSEDES,
+                      "AUTRE": ["AUTRE", "TRG_AUTRE"]},
+            dependants={"SAL_HISTORY": ["TRG_AUTRE"]},
+            signatures=_SIGNATURES + [["TABLE", "AUTRE"],
+                                      ["TRIGGER", "TRG_AUTRE"]],
+        )
+        plan = plan_table_filter(faux, "SRC", standalone=True)
+        self.assertNotIn("SAL_HISTORY", plan.standalone)
+
+    def test_un_dependant_de_type_table_ne_disqualifie_pas(self):
+        """Un lien table-a-table sans FK ne rend pas la table « utilisee ».
+
+        C'est le volet referentiel qui tranche ces liens : compter ici une
+        dependance dont le referenceur est lui-meme une table rendrait la
+        regle dependante d'une seconde lecture des FK.
+        """
+        faux = _faux(
+            dependants={"REGIONS": ["OTHER_TABLE"]},
+            signatures=_SIGNATURES + [["TABLE", "OTHER_TABLE"]],
+        )
+        plan = plan_table_filter(faux, "SRC", standalone=True)
+        self.assertIn("REGIONS", plan.standalone)
+
+    def test_une_fk_sortante_ecarte_la_table(self):
+        """Une table qui reference est liee, meme si personne ne la cite."""
+        plan = plan_table_filter(
+            _faux(fk_sortantes=["EMPLOYEES"]), "SRC", standalone=True
+        )
+        self.assertNotIn("EMPLOYEES", plan.standalone)
+        self.assertEqual(
+            plan.standalone,
+            ["DEPARTMENTS", "REGIONS", "SAL_HISTORY", "TMP_LOAD"],
+        )
+
+    def test_une_fk_entrante_ecarte_la_table(self):
+        """Une table referencee est liee, meme si elle ne reference rien.
+
+        C'est la moitie que le SQL du besoin exprime par la jointure sur
+        `r_constraint_name` : la FK peut venir d'un autre schema, la table
+        n'en est pas moins attendue.
+        """
+        plan = plan_table_filter(
+            _faux(fk_entrantes=["DEPARTMENTS"]), "SRC", standalone=True
+        )
+        self.assertNotIn("DEPARTMENTS", plan.standalone)
+        self.assertIn("REGIONS", plan.standalone)
+
+    def test_un_schema_entierement_relie_ne_filtre_rien_mais_le_dit(self):
+        """Zero table isolee n'est pas une faute : c'est un fait a rapporter.
+
+        Le plan reste inactif — rien a exporter differemment — mais
+        `standalone_requested` distingue « regle posee, rien trouve » de
+        « regle absente », que le rapport ne doit pas confondre.
+        """
+        plan = plan_table_filter(
+            _faux(fk_sortantes=_TABLES), "SRC", standalone=True
+        )
+        self.assertFalse(plan.active)
+        self.assertEqual(plan.standalone, [])
+        self.assertEqual(plan.data_only, [])
+        self.assertTrue(plan.standalone_requested)
+
+    def test_la_definition_est_dans_la_requete(self):
+        """Les conditions de la definition sont bien envoyees.
+
+        Le faux repond a partir de declarations ; rien dans la reponse ne
+        prouve que la **requete** porte les deux `NOT EXISTS`. C'est
+        pourtant toute la definition referentielle : une requete qui
+        oublierait le volet entrant exclurait des tables que d'autres
+        schemas attendent. Le troisieme volet — l'usage — est lu a part,
+        et doit lui aussi atteindre la base.
+        """
+        faux = _faux(
+            dependants={**_DEPENDANTS, "SAL_HISTORY": ["TRG_SAL"]},
+            signatures=_SIGNATURES + [["TRIGGER", "TRG_SAL"]],
+        )
+        plan_table_filter(faux, "SRC", standalone=True)
+        sql = " ".join(faux.queries).lower()
+        self.assertEqual(sql.count("not exists"), 2)
+        self.assertIn("r_constraint_name", sql)
+        self.assertIn("constraint_type = 'r'", sql)
+        self.assertIn("from dba_tables", sql)
+        self.assertIn("from dba_dependencies", sql)
+        self.assertIn("referenced_type = 'table'", sql)
+        # La base des triggers est relue pour ne pas confondre le trigger
+        # propre a la table avec un lecteur externe.
+        self.assertIn("select trigger_name, table_name from dba_triggers", sql)
+
+    def test_l_exclusion_totale_prime_sur_la_regle_isolee(self):
+        """Une table des deux listes part en entier, et n'est plus « isolee ».
+
+        La nommer encore parmi les isolees ferait lire deux traitements
+        pour une seule table — dont l'un, le mode B, n'a pas eu lieu.
+        """
+        plan = plan_table_filter(
+            _faux(), "SRC", tables=["REGIONS"], standalone=True
+        )
+        self.assertIn("REGIONS", plan.overlap)
+        self.assertIn("REGIONS", plan.excluded)
+        self.assertNotIn("REGIONS", plan.data_only)
+        self.assertNotIn("REGIONS", plan.standalone)
+
+    def test_la_regle_emet_des_query_et_jamais_d_exclude(self):
+        """La regle est du mode B : des `query=`, aucun `exclude=`.
+
+        Un `exclude=` ici contredirait `INCLUDE`, que le mode B accepte ;
+        c'est le controle qui garde la regle dans son mode.
+        """
+        faux = _faux(fk_sortantes=["EMPLOYEES"])
+        plan = plan_table_filter(faux, "SRC", standalone=True)
+        self.assertEqual(plan.exclude_clause(), "")
+        self.assertEqual(len(plan.query_lines()), 4)
+        for ligne in plan.query_lines():
+            self.assertIn('"WHERE 1=2"', ligne)
+
+    def test_un_plan_avec_isolees_survit_a_l_etat(self):
+        """Resoudre a l'etape 6, figer, relire : le `resume` doit voir
+        la meme liste, drapeau compris."""
+        plan = plan_table_filter(_faux(), "SRC", standalone=True)
+        relu = TableFilterPlan.from_dict(plan.to_dict())
+        self.assertEqual(relu.standalone, plan.standalone)
+        self.assertTrue(relu.standalone_requested)
+        self.assertEqual(relu.to_dict(), plan.to_dict())
+
+    def test_un_etat_anterieur_ignore_le_drapeau(self):
+        """Un etat ecrit avant la regle se relit avec le drapeau a `False`."""
+        plan = TableFilterPlan.from_dict({"schema": "SRC"})
+        self.assertEqual(plan.standalone, [])
+        self.assertFalse(plan.standalone_requested)
+
+
+class TestAdditionDesOptions(unittest.TestCase):
+    """`EXCLUDE_STANDALONE_TABLES` s'ajoute aux autres, il ne les remplace pas.
+
+    Les quatre listes ecrites et la regle des isolees vivent dans deux
+    modes : `EXCLUDE_TABLES` et son motif sont des exclusions **totales**,
+    `EXCLUDE_TABLES_DATA` et son motif des exclusions **de donnees**. La
+    regle verse dans le second. Rien dans le code ne doit court-circuiter
+    l'un au profit de l'autre : desactiver les listes quand la regle est
+    posee ferait disparaitre un filtre que l'exploitant a demande.
+    """
+
+    #: Les isolees du faux schema par defaut (`EMPLOYEES` est lue par
+    #: `V_EMP` et `PKG_EMP`, donc pas isolee).
+    _ISOLEES = ["DEPARTMENTS", "REGIONS", "SAL_HISTORY", "TMP_LOAD"]
+
+    def test_exclude_tables_s_ajoute_a_la_regle_isolee(self):
+        """Mode A ecrit **et** regle posee : les deux effets coexistent.
+
+        Sans addition, poser la regle ferait oublier `EXCLUDE_TABLES` — ou
+        l'inverse — et la table pourtant nommee partirait.
+        """
+        plan = plan_table_filter(_faux(), "SRC",
+                                 tables=["EMPLOYEES"], standalone=True)
+        self.assertEqual(plan.excluded, ["EMPLOYEES"])
+        self.assertEqual(plan.data_only, self._ISOLEES)
+        self.assertEqual(plan.standalone, self._ISOLEES)
+        # Les deux formes atteignent le parfile en meme temps.
+        self.assertEqual(plan.exclude_clause(), 'TABLE:"IN (\'EMPLOYEES\')"')
+        self.assertEqual(len(plan.query_lines()), len(self._ISOLEES))
+
+    def test_exclude_tables_data_s_ajoute_a_la_regle_isolee(self):
+        """Deux sources du mode B : la liste ecrite **et** la regle.
+
+        `EMPLOYEES` n'est pas isolee, mais elle est explicitement demandee
+        sans donnees : elle doit y etre, a cote des isolees. La regle ne
+        la remplace pas, et elle ne la retire pas non plus.
+        """
+        plan = plan_table_filter(_faux(), "SRC",
+                                 tables_data=["EMPLOYEES"], standalone=True)
+        self.assertEqual(
+            plan.data_only,
+            ["DEPARTMENTS", "EMPLOYEES", "REGIONS", "SAL_HISTORY", "TMP_LOAD"],
+        )
+        # `standalone` ne liste que les isolees : `EMPLOYEES` est en mode B
+        # par la liste, pas par la regle.
+        self.assertEqual(plan.standalone, self._ISOLEES)
+
+    def test_exclude_tables_regex_s_ajoute_a_la_regle_isolee(self):
+        """Le motif du mode A compte comme la liste : il reste actif."""
+        plan = plan_table_filter(_faux(), "SRC",
+                                 tables_regex=["^EMP"], standalone=True)
+        self.assertEqual(plan.excluded, ["EMPLOYEES"])
+        self.assertEqual(plan.data_only, self._ISOLEES)
+        self.assertEqual(plan.standalone, self._ISOLEES)
+
+    def test_exclude_tables_data_regex_s_ajoute_a_la_regle_isolee(self):
+        """Le motif du mode B s'unit aux isolees, sans en ecraser aucune."""
+        plan = plan_table_filter(_faux(), "SRC",
+                                 tables_data_regex=["^EMP"], standalone=True)
+        self.assertIn("EMPLOYEES", plan.data_only)
+        self.assertEqual(
+            plan.data_only,
+            ["DEPARTMENTS", "EMPLOYEES", "REGIONS", "SAL_HISTORY", "TMP_LOAD"],
+        )
+        self.assertEqual(plan.standalone, self._ISOLEES)
+
+    def test_le_chevauchement_ne_retire_que_la_table_concernee(self):
+        """Une isolee nommee en exclusion totale part en entier ; les
+        autres isolees restent en mode B.
+
+        C'est le seul point ou les deux modes se rencontrent, et il ne doit
+        emporter que la table en cause — pas toute la regle.
+        """
+        plan = plan_table_filter(_faux(), "SRC",
+                                 tables=["REGIONS"], standalone=True)
+        self.assertEqual(plan.excluded, ["REGIONS"])
+        self.assertEqual(plan.overlap, ["REGIONS"])
+        self.assertNotIn("REGIONS", plan.data_only)
+        self.assertNotIn("REGIONS", plan.standalone)
+        self.assertEqual(
+            plan.data_only, ["DEPARTMENTS", "SAL_HISTORY", "TMP_LOAD"]
+        )
+        self.assertEqual(
+            plan.standalone, ["DEPARTMENTS", "SAL_HISTORY", "TMP_LOAD"]
+        )
+
+
 class TestEtatCongele(unittest.TestCase):
     """La representation rangee dans l'etat, et sa relecture par un
     `resume`."""

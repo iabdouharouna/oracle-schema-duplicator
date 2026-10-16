@@ -126,6 +126,7 @@ def _safe_options(cfg) -> Dict[str, Any]:
         "CONTENT", "COMPRESSION", "PARALLEL", "REMAP_TABLESPACE",
         "EXCLUDE", "INCLUDE", "EXCLUDE_TABLES", "EXCLUDE_TABLES_REGEX",
         "EXCLUDE_TABLES_DATA", "EXCLUDE_TABLES_DATA_REGEX",
+        "EXCLUDE_STANDALONE_TABLES",
         "TABLE_EXISTS_ACTION", "VALIDATION_LEVEL",
         "ALLOW_EXISTING_TARGET", "TRANSFER_MODE",
     ]
@@ -307,6 +308,7 @@ def _artifact_lines(artifacts: Dict[str, Any]) -> List[str]:
             for etiquette, noms in (
                 ("hors duplication", exclues),
                 ("sans donnees", vides),
+                ("isolees", value.get("standalone") or []),
                 ("dependants", value.get("dependents") or []),
                 ("presente(s) dans les deux listes", value.get("overlap") or []),
                 ("sans effet", value.get("unmatched") or []),

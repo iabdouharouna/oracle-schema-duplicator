@@ -676,6 +676,32 @@ class TestFiltrageDesTables(unittest.TestCase):
                 for w in cfg.warnings)
         )
 
+    def test_la_regle_isolee_est_un_booleen_desactive_par_defaut(self):
+        """La regle est opt-in : un schema sans elle se comporte comme avant.
+
+        Un defaut a `True` exclurait les donnees d'un schema sans que
+        personne ne l'ait demande — la pire des valeurs par defaut pour
+        une operation qui retire des lignes.
+        """
+        self.assertFalse(support.load_config().get("EXCLUDE_STANDALONE_TABLES"))
+        self.assertTrue(
+            support.load_config(EXCLUDE_STANDALONE_TABLES="true")
+            .get("EXCLUDE_STANDALONE_TABLES")
+        )
+
+    def test_metadata_only_rend_la_regle_isolee_sans_effet(self):
+        """La regle alimente le mode B : sans donnees exportees, rien a retirer.
+
+        L'avertissement doit nommer cette cle-la, et non `EXCLUDE_TABLES_DATA`
+        qu'aucune ligne ne porte.
+        """
+        cfg = support.load_config(CONTENT="METADATA_ONLY",
+                                  EXCLUDE_STANDALONE_TABLES="true")
+        self.assertTrue(
+            any("EXCLUDE_STANDALONE_TABLES" in w and "sans effet" in w
+                for w in cfg.warnings)
+        )
+
     def test_include_est_incompatible_avec_lexclusion(self):
         """`UDE-00011`, mesure sur une 19c reelle.
 
@@ -711,6 +737,18 @@ class TestFiltrageDesTables(unittest.TestCase):
                                   EXCLUDE_TABLES_DATA="REGIONS")
         self.assertEqual(cfg.get("INCLUDE"), ["TABLE:DEPT"])
         self.assertEqual(cfg.get("EXCLUDE_TABLES_DATA"), ["REGIONS"])
+
+    def test_la_regle_isolee_se_cumule_a_include(self):
+        """Elle aussi pose des `query=`, jamais un `exclude=`.
+
+        La table isolee est decidee a l'etape 6, pas au chargement : refuser
+        `INCLUDE` ici au motif qu'une table pourrait etre isolee
+        interdirait une combinaison que le client accepte.
+        """
+        cfg = support.load_config(INCLUDE="TABLE:DEPT",
+                                  EXCLUDE_STANDALONE_TABLES="true")
+        self.assertEqual(cfg.get("INCLUDE"), ["TABLE:DEPT"])
+        self.assertTrue(cfg.get("EXCLUDE_STANDALONE_TABLES"))
 
     def test_include_seul_reste_accepte(self):
         """`include=TABLE` seul n'a jamais ete en cause.

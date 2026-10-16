@@ -15,7 +15,6 @@ la connectivite d'un serveur.
 from __future__ import annotations
 
 import os
-import re
 import sys
 import tempfile
 from pathlib import Path
@@ -216,56 +215,39 @@ class FakeAdapter:
 # Adaptateur « filtrage de tables »
 # --------------------------------------------------------------------------
 
-#: Premier groupe `IN (...)` d'une requete, hors `NOT IN`. C'est la
-#: liste que le code teste y place, et la seule que le faux doit lire.
-_IN_GROUPE = re.compile(r"(?<!not )\bin \(([^)]*)\)", re.IGNORECASE)
-_LITTERAL = re.compile(r"'((?:[^']|'')*)'")
-
-
-def noms_designes(sql: str) -> List[str]:
-    """Noms cites dans le premier `IN (...)` d'une requete.
-
-    Les trois interrogations du plan placent leur cible dans ce
-    premier groupe : les tables fermees pour la cascade, les references
-    pour les dependants, les objets pour les signatures. Oracle resout
-    la requete ainsi ; un faux qui repondrait sans la lire verifierait
-    qu'une liste est bien partie, jamais que c'est la bonne.
-
-    `not in` est ecarte par construction : `object_type not in
-    ('SYNONYM', 'DATABASE LINK')` precede toujours la liste voulue, et
-    la lire rendrait une liste de **types** pour une liste de noms —
-    deux listes de chaines, sans autre difference visible.
-    """
-    groupe = _IN_GROUPE.search(sql)
-    if groupe is None:
-        return []
-    return [lit.replace("''", "'") for lit in _LITTERAL.findall(groupe.group(1))]
-
-
 class SourceFiltre(FakeAdapter):
     """Schema source dont les requetes du filtre sont resolues comme
     Oracle les resoudrait.
 
-    `FakeAdapter` indexe ses reponses par sous-chaine de requete, et le
-    filtrage le met en defaut : `_owned_names` est appele deux fois —
-    une par mode — et ses deux requetes ne different que par la liste
-    `IN`. Choisir la cle revient alors a memoriser l'ordre de tri de
-    cette liste, c'est-a-dire a tester le faux plutot que le code.
+    Le filtrage lit desormais les vues de dictionnaire **en entier** pour
+    le schema, et recoupe en Python : aucune de ses requetes ne porte de
+    liste `IN`. Le faux repond donc sans lire de liste, et rend tout ce
+    que la vue contiendrait pour le schema.
 
-    Le routage se fait donc sur le contenu de la requete, et la liste
-    `IN` est lue. Le reste (inventaire, privileges, etat des jobs)
-    retombe sur le mecanisme habituel : un faux qui repondrait a tout
-    depuis son propre catalogue repondrait mal aux etapes qu'il ne
-    teste pas — notamment l'etape 16, qui compare deux inventaires.
+    Le reste (inventaire, privileges, etat des jobs) retombe sur le
+    mecanisme habituel : un faux qui repondrait a tout depuis son propre
+    catalogue repondrait mal aux etapes qu'il ne teste pas — notamment
+    l'etape 16, qui compare deux inventaires.
 
     Donnees attendues, toutes facultatives :
 
     * `tables` — les tables du schema ;
     * `possedes` — table -> objets qui partent avec elle (la table
       comprise) : la cascade reelle de `EXCLUDE=TABLE` ;
-    * `dependants` — objet -> objets qui le referencent ;
+    * `dependants` — objet -> objets qui le referencent. Sert la
+      fermeture du mode A, et aussi le volet « utilisee » de la regle des
+      tables isolees : un dependant dont le type (lu dans `signatures`)
+      n'est pas `TABLE` disqualifie la table qu'il reference — sauf un
+      trigger **pose sur cette table**, dont la base est relue dans
+      `possedes` ;
     * `signatures` — paires `[type, nom]`, ordonnees comme la requete
-      les rend, et source unique des signatures `TYPE~NOM`.
+      les rend, et source unique des signatures `TYPE~NOM` ;
+    * `fk_sortantes` / `fk_entrantes` — tables du schema reliees par une
+      cle etrangere, respectivement en sortie et en entree. Les deux sont
+      declarees separement parce que ce sont les deux moities de la
+      definition d'une table isolee : les confondre ne dirait pas
+      laquelle des deux conditions a repondu. La requete `DBA_TABLES` les
+      reunit, comme la definition le fait.
     """
 
     def query(self, sql: str) -> List[List[str]]:
@@ -280,23 +262,62 @@ class SourceFiltre(FakeAdapter):
 
         if "from dba_dependencies" in bas:
             table: Dict[str, List[str]] = self._get("dependants", {})
-            return [[d] for nom in noms_designes(sql)
-                    for d in table.get(nom, [])]
+            if "referenced_type = 'table'" in bas:
+                # Volet « utilisee » de `_used_tables` : triples
+                # `(table referencee, nom du referenceur, type)`. Le type
+                # est relu dans l'inventaire declare — un nom seul ne dit
+                # pas si le referenceur est une vue, un package ou une
+                # table. Un referenceur absent de l'inventaire est rendu
+                # comme `TABLE` : non etabli comme un usage, il ne
+                # disqualifie pas.
+                type_par_nom = {str(sig[1]): str(sig[0])
+                                for sig in self._get("signatures", [])
+                                if len(sig) > 1}
+                return [[reference, dependant,
+                         type_par_nom.get(dependant, "TABLE")]
+                        for reference, dependants in table.items()
+                        for dependant in dependants]
+            # Toutes les aretes du schema : la fermeture se fait cote
+            # code, pas cote requete.
+            return [[reference, dependant]
+                    for reference, dependants in table.items()
+                    for dependant in dependants]
 
-        if "select index_name from dba_indexes" in bas:
+        if "select trigger_name, table_name from dba_triggers" in bas:
+            # Base de chaque trigger : un trigger voyage avec la table sur
+            # laquelle il est pose, et `possedes` la nomme. C'est cette
+            # correspondance qui distingue un trigger propre a la table
+            # (il ne la disqualifie pas) d'un trigger d'une autre table.
+            type_par_nom = {str(sig[1]): str(sig[0])
+                            for sig in self._get("signatures", [])
+                            if len(sig) > 1}
             possedes: Dict[str, List[str]] = self._get("possedes", {})
-            vus: List[str] = []
-            for nom in noms_designes(sql):
-                for objet in possedes.get(nom, []):
-                    if objet not in vus:
-                        vus.append(objet)
-            return [[objet] for objet in vus]
+            return [[objet, table]
+                    for table, objets in possedes.items()
+                    for objet in objets
+                    if type_par_nom.get(objet) == "TRIGGER"]
 
-        if ("select object_type, object_name from dba_objects" in bas
-                and "object_name in (" in bas):
-            noms = set(noms_designes(sql))
-            return [list(sig) for sig in self._get("signatures", [])
-                    if len(sig) > 1 and sig[1] in noms]
+        if "from dba_tables" in bas:
+            # La definition d'une table isolee : hors de la reunion des
+            # FK sortantes et entrantes. Oracle repond `DBA_TABLES` moins
+            # les deux `NOT EXISTS` ; le faux recompose le meme ensemble.
+            liees = set(self._get("fk_sortantes", []))
+            liees |= set(self._get("fk_entrantes", []))
+            return [[t] for t in self._get("tables", [])
+                    if t not in liees]
+
+        if ("from dba_indexes" in bas or "from dba_triggers" in bas
+                or "from dba_lobs" in bas):
+            # La cascade, table a table. Oracle rend des paires
+            # `(table_name, nom d'objet)` ; le code ne garde que les
+            # tables qu'il a filtrees.
+            possedes: Dict[str, List[str]] = self._get("possedes", {})
+            return [[table, objet]
+                    for table, objets in possedes.items()
+                    for objet in objets]
+
+        if "select object_type, object_name from dba_objects" in bas:
+            return [list(sig) for sig in self._get("signatures", [])]
 
         if "object_name not like 'bin$%'" in bas:
             return [[nom] for nom in self._get("tables", [])]
